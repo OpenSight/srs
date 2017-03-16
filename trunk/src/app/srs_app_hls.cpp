@@ -901,8 +901,8 @@ int SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
         
         if (segment->is_sequence_header) {
             // #EXT-X-DISCONTINUITY\n
-            ss << "#EXT-X-DISCONTINUITY" << SRS_CONSTS_LF;
-            srs_verbose("write m3u8 segment discontinuity success.");
+            //ss << "#EXT-X-DISCONTINUITY" << SRS_CONSTS_LF;
+            //srs_verbose("write m3u8 segment discontinuity success.");
         }
         
         // "#EXTINF:4294967295.208,\n"
