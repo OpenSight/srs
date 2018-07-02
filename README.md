@@ -1,8 +1,8 @@
-#Simple-RTMP-Server
+# Simple-RTMP-Server
 
 [![CircleCI](https://circleci.com/gh/ossrs/srs/tree/2.0release.svg?style=svg)](https://circleci.com/gh/ossrs/srs/tree/2.0release)
-[![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/ossrs/srs?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 [![Wechat](https://cloud.githubusercontent.com/assets/2777660/22814959/c51cbe72-ef92-11e6-81cc-32b657b285d5.png)](https://github.com/ossrs/srs/wiki/v1_CN_Contact#wechat)
+[<img width="52" alt="Skype" src="https://cloud.githubusercontent.com/assets/2777660/24329166/3821a328-1230-11e7-844a-506a5d17dd3d.png">](https://github.com/ossrs/srs/wiki/v1_EN_Contact#skype-or-gitter)
 
 SRS/2.0, [ZhouGuowen][release2]
 
@@ -73,12 +73,6 @@ Github: [https://github.com/ossrs/srs][srs], the GIT usage([CN][v1_CN_Git], [EN]
 
 ```
 git clone https://github.com/ossrs/srs.git
-```
-
-CSDN: [https://code.csdn.net/winlinvip/srs-csdn][csdn], the GIT usage([CN][v1_CN_Git], [EN][v1_EN_Git])
-
-```
-git clone https://code.csdn.net/winlinvip/srs-csdn.git
 ```
 
 OSChina: [http://git.oschina.net/winlinvip/srs.oschina][oschina], the GIT usage([CN][v1_CN_Git], [EN][v1_EN_Git])
@@ -300,6 +294,8 @@ Remark:
 
 ## Releases
 
+* 2017-06-10, [Release v2.0-r2][r2.0r2], 2.0 release2, 2.0.243, 86670 lines.
+* 2017-04-18, [Release v2.0-r1][r2.0r1], 2.0 release1, 2.0.239, 86515 lines.
 * 2017-03-03, [Release v2.0-r0][r2.0r0], 2.0 release0, 2.0.234, 86373 lines.
 * 2017-01-18, [Release v2.0-b4][r2.0b4], 2.0 beta4, 2.0.230, 86334 lines.
 * 2016-11-13, [Release v2.0-b3][r2.0b3], 2.0 beta3, 2.0.223, 86685 lines.
@@ -336,6 +332,22 @@ Remark:
 
 ## History
 
+* v2.0, 2018-02-28, Merge [#1077][bug #1077], fix crash for edge HLS. 2.0.247
+* v2.0, 2018-02-13, Fix [#1059][bug #1059], support vhost in stream parameters. 2.0.246
+* v2.0, 2018-01-07, Merge [#1045][bug #1045], fix [#1044][bug #1044], TCP connection alive detection. 2.0.245
+* v2.0, 2018-01-04, Merge [#1039][bug #1039], fix bug of init.d script.
+* v2.0, 2018-01-01, Merge [#1033][bug #1033], allow user to add some specific flags. 2.0.244
+* <strong>v2.0, 2017-06-10, [2.0 release2(2.0.243)][r2.0r2] released. 86670 lines.</strong>
+* v2.0, 2017-05-29, Merge [#899][bug #899] to fix [#893][bug #893], ts PES ext length. 2.0.243
+* v2.0, 2017-05-01, Fix [#865][bug #865], shouldn't remove ts/m3u8 when hls_dispose disabled. 2.0.242
+* v2.0, 2017-04-30, Fix [#636][bug #636], FD leak for requesting empty HTTP stream. 2.0.241
+* v2.0, 2017-04-23, Fix [#851][bug #851], HTTP API support number of video frames for FPS. 2.0.240
+* <strong>v2.0, 2017-04-18, [2.0 release1(2.0.239)][r2.0r1] released. 86515 lines.</strong>
+* v2.0, 2017-04-18, Fix [#848][bug #848], crash at HTTP fast buffer grow. 2.0.239
+* v2.0, 2017-04-15, Fix [#844][bug #844], support Haivision encoder. 2.0.238
+* v2.0, 2017-04-15, Merge [#846][bug #846], fix fd leak for FLV stream caster. 2.0.237
+* v2.0, 2017-04-15, Merge [#841][bug #841], avoid the duplicated sps/pps in ts. 2.0.236
+* v2.0, 2017-04-09, Fix [#834][bug #834], crash for TS context corrupt. 2.0.235
 * <strong>v2.0, 2017-03-03, [2.0 release0(2.0.234)][r2.0r0] released. 86373 lines.</strong>
 * v2.0, 2017-02-25, for [#730][bug #730], remove the test code. 2.0.234
 * v2.0, 2017-02-09, fix [#503][bug #503] disable utilities when reload a source. 2.0.233
@@ -1279,10 +1291,28 @@ Winlin
 [bug #750]: https://github.com/ossrs/srs/issues/750
 [bug #752]: https://github.com/ossrs/srs/issues/752
 [bug #503]: https://github.com/ossrs/srs/issues/503
+[bug #834]: https://github.com/ossrs/srs/issues/834
+[bug #841]: https://github.com/ossrs/srs/issues/841
+[bug #846]: https://github.com/ossrs/srs/issues/846
+[bug #844]: https://github.com/ossrs/srs/issues/844
+[bug #848]: https://github.com/ossrs/srs/issues/848
+[bug #851]: https://github.com/ossrs/srs/issues/851
+[bug #636]: https://github.com/ossrs/srs/issues/636
+[bug #865]: https://github.com/ossrs/srs/issues/865
+[bug #893]: https://github.com/ossrs/srs/issues/893
+[bug #899]: https://github.com/ossrs/srs/issues/899
+[bug #1033]: https://github.com/ossrs/srs/issues/1033
+[bug #1039]: https://github.com/ossrs/srs/issues/1039
+[bug #1044]: https://github.com/ossrs/srs/issues/1044
+[bug #1045]: https://github.com/ossrs/srs/issues/1045
+[bug #1059]: https://github.com/ossrs/srs/issues/1059
+[bug #1077]: https://github.com/ossrs/srs/issues/1077
 [bug #xxxxxxxxxx]: https://github.com/ossrs/srs/issues/xxxxxxxxxx
 
 [exo #828]: https://github.com/google/ExoPlayer/pull/828
 
+[r2.0r2]: https://github.com/ossrs/srs/releases/tag/v2.0-r2
+[r2.0r1]: https://github.com/ossrs/srs/releases/tag/v2.0-r1
 [r2.0r0]: https://github.com/ossrs/srs/releases/tag/v2.0-r0
 [r2.0b4]: https://github.com/ossrs/srs/releases/tag/v2.0-b4
 [r2.0b3]: https://github.com/ossrs/srs/releases/tag/v2.0-b3
@@ -1327,6 +1357,6 @@ Winlin
 [branch2]: https://github.com/ossrs/srs/tree/2.0release
 [release2]: https://github.com/ossrs/srs/wiki/v1_CN_Product#release20
 [release3]: https://github.com/ossrs/srs/wiki/v1_CN_Product#release30
-[centos0]: http://winlinvip.github.io/srs.release/releases/files/SRS-CentOS6-x86_64-2.0.234.zip
-[centos1]: http://www.ossrs.net/srs.release/releases/files/SRS-CentOS6-x86_64-2.0.234.zip
+[centos0]: http://winlinvip.github.io/srs.release/releases/files/SRS-CentOS6-x86_64-2.0.243.zip
+[centos1]: http://www.ossrs.net/srs.release/releases/files/SRS-CentOS6-x86_64-2.0.243.zip
 
