@@ -1161,6 +1161,13 @@ void SrsHls::dispose()
         on_unpublish();
     }
     
+    // Ignore when hls_dispose disabled.
+    // @see https://github.com/ossrs/srs/issues/865
+    int hls_dispose = _srs_config->get_hls_dispose(_req->vhost);
+    if (!hls_dispose) {
+        return;
+    }
+    
     muxer->dispose();
 }
 
@@ -1198,9 +1205,12 @@ int SrsHls::cycle()
     return ret;
 }
 
-int SrsHls::initialize(SrsSource* s)
+int SrsHls::initialize(SrsSource* s, SrsRequest* r)
 {
     int ret = ERROR_SUCCESS;
+
+    srs_assert(!_req);
+    _req = r->copy();
 
     source = s;
 
@@ -1214,9 +1224,6 @@ int SrsHls::initialize(SrsSource* s)
 int SrsHls::on_publish(SrsRequest* req, bool fetch_sequence_header)
 {
     int ret = ERROR_SUCCESS;
-    
-    srs_freep(_req);
-    _req = req->copy();
     
     // update the hls time, for hls_dispose.
     last_update_time = srs_get_system_time_ms();
