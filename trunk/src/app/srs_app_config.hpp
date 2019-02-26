@@ -1121,6 +1121,14 @@ public:
     * @return the disk device name to stat. NULL if not configed.
     */
     virtual SrsConfDirective*   get_stats_disk_device();
+    
+    /**
+    * get bw_limit.
+    * @param vhost, the vhost to get the chunk size. use global if not specified.
+    *       empty string to get the global.
+    * @remark, default 0, means no limit
+    */
+    virtual int                 get_bw_limit(std::string vhost);
 };
 
 namespace _srs_internal

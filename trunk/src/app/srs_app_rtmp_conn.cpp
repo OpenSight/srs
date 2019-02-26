@@ -898,6 +898,8 @@ int SrsRtmpConn::do_publishing(SrsSource* source, SrsPublishRecvThread* trd)
     publish_1stpkt_timeout = _srs_config->get_publish_1stpkt_timeout(req->vhost);
     publish_normal_timeout = _srs_config->get_publish_normal_timeout(req->vhost);
     
+    bw_limit = _srs_config->get_bw_limit(req->vhost);
+    
     // set the sock options.
     set_sock_options();
     
@@ -953,10 +955,20 @@ int SrsRtmpConn::do_publishing(SrsSource* source, SrsPublishRecvThread* trd)
             return ret;
         }
         nb_frames = trd->nb_video_frames();
-
+        
+        kbps->sample();
+        if(bw_limit != 0){
+            if(kbps->get_recv_kbps_30s() > bw_limit){
+                ret = ERROR_SYSTEM_BANDWIDTH_DENIED;
+                srs_warn("Publish bandwith(%d bps) exceed the limitation(%d bps)",
+                    kbps->get_recv_kbps_30s(), bw_limit);
+                break;                
+            }
+        }
+        
+        
         // reportable
         if (pprint->can_print()) {
-            kbps->sample();
             bool mr = _srs_config->get_mr_enabled(req->vhost);
             int mr_sleep = _srs_config->get_mr_sleep_ms(req->vhost);
             srs_trace("<- "SRS_CONSTS_LOG_CLIENT_PUBLISH

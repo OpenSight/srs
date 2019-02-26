@@ -2698,6 +2698,8 @@ int SrsConfig::get_publish_1stpkt_timeout(string vhost)
     return ::atoi(conf->arg0().c_str());
 }
 
+
+
 int SrsConfig::get_publish_normal_timeout(string vhost)
 {
     // the timeout for publish recv.
@@ -2717,6 +2719,8 @@ int SrsConfig::get_publish_normal_timeout(string vhost)
     
     return ::atoi(conf->arg0().c_str());
 }
+
+
 
 int SrsConfig::get_global_chunk_size()
 {
@@ -4486,6 +4490,27 @@ SrsConfDirective* SrsConfig::get_stats_disk_device()
     }
     
     return conf;
+}
+
+int SrsConfig::get_bw_limit(std::string vhost)
+{
+    if (vhost.empty()) {
+        return 0;
+    }
+    
+    SrsConfDirective* conf = get_vhost(vhost);
+
+    if (!conf) {
+        return 0;
+    }
+
+    conf = conf->get("bw_limit");
+    if (!conf || conf->arg0().empty()) {
+        // vhost does not specify bw_limit,
+        return 0;
+    }
+
+    return ::atoi(conf->arg0().c_str());
 }
 
 namespace _srs_internal

@@ -51,6 +51,8 @@ using namespace std;
 #define CONST_MAX_JITTER_MS_NEG         -250
 #define DEFAULT_FRAME_TIME_MS         10
 
+#define CONST_MAX_FRAME_INTERVAL_MS    5000
+
 // for 26ms per audio packet,
 // 115 packets is 3s.
 #define SRS_PURE_AUDIO_GUESS_COUNT 115
@@ -1619,6 +1621,13 @@ int SrsSource::on_audio(SrsCommonMessage* shared_audio)
             srs_warn("AUDIO: stream not monotonically increase, please open mix_correct.");
         }
     }
+    if(last_packet_time > 0 && shared_audio->header.timestamp < last_packet_time - CONST_MAX_FRAME_INTERVAL_MS){
+        srs_error("AUDIO: frame's timestamp(%lld ms) is %lld ms less than last timestamp(%lld ms)",
+                   (long long)shared_audio->header.timestamp, 
+                   (long long)last_packet_time - shared_audio->header.timestamp,
+                   (long long)last_packet_time);
+        return ERROR_SYSTEM_PACKET_INVALID;
+    }
     last_packet_time = shared_audio->header.timestamp;
     
     // convert shared_audio to msg, user should not use shared_audio again.
@@ -1836,6 +1845,13 @@ int SrsSource::on_video(SrsCommonMessage* shared_video)
             is_monotonically_increase = false;
             srs_warn("VIDEO: stream not monotonically increase, please open mix_correct.");
         }
+    }
+    if(last_packet_time > 0 && shared_video->header.timestamp < last_packet_time - CONST_MAX_FRAME_INTERVAL_MS){
+        srs_error("VIDEO: frame's timestamp(%lld ms) is %lld ms less than last timestamp(%lld ms)",
+                   (long long)shared_video->header.timestamp, 
+                   (long long)last_packet_time - shared_video->header.timestamp,
+                   (long long)last_packet_time);
+        return ERROR_SYSTEM_PACKET_INVALID;
     }
     last_packet_time = shared_video->header.timestamp;
     
