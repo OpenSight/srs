@@ -1825,7 +1825,7 @@ int SrsConfig::check_config()
                 && n != "publish_1stpkt_timeout" && n != "publish_normal_timeout"
                 && n != "security" && n != "http_remux"
                 && n != "http" && n != "http_static"
-                && n != "hds"
+                && n != "hds" && n!= "bw_limit_kbps"
             ) {
                 ret = ERROR_SYSTEM_CONFIG_INVALID;
                 srs_error("unsupported vhost directive %s, ret=%d", n.c_str(), ret);
@@ -4492,7 +4492,7 @@ SrsConfDirective* SrsConfig::get_stats_disk_device()
     return conf;
 }
 
-int SrsConfig::get_bw_limit(std::string vhost)
+int SrsConfig::get_bw_limit_kbps(std::string vhost)
 {
     if (vhost.empty()) {
         return 0;
@@ -4504,7 +4504,7 @@ int SrsConfig::get_bw_limit(std::string vhost)
         return 0;
     }
 
-    conf = conf->get("bw_limit");
+    conf = conf->get("bw_limit_kbps");
     if (!conf || conf->arg0().empty()) {
         // vhost does not specify bw_limit,
         return 0;

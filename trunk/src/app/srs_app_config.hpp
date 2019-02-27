@@ -1128,7 +1128,7 @@ public:
     *       empty string to get the global.
     * @remark, default 0, means no limit
     */
-    virtual int                 get_bw_limit(std::string vhost);
+    virtual int                 get_bw_limit_kbps(std::string vhost);
 };
 
 namespace _srs_internal
