@@ -2689,7 +2689,7 @@ srs_error_t SrsConfig::check_normal_config()
                 && n != "play" && n != "publish" && n != "cluster"
                 && n != "security" && n != "http_remux" && n != "dash"
                 && n != "http_static" && n != "hds" && n != "exec"
-                && n != "in_ack_size" && n != "out_ack_size" && n != "rtc") {
+                && n != "in_ack_size" && n != "out_ack_size" && n != "rtc" && n != "bw_limit_kbps") {
                 return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "illegal vhost.%s", n.c_str());
             }
             // for each sub directives of vhost.
@@ -7251,23 +7251,23 @@ SrsConfDirective* SrsConfig::get_stats_disk_device()
     return conf;
 }
 
-int SrsConfig::get_bw_limit_kbps(std::string vhost)
+int SrsConfig::get_bw_limit_kbps(string vhost)
 {
+    static int DEFAULT = 0;
+
     if (vhost.empty()) {
-        return 0;
+        return DEFAULT;
+    }
+
+    SrsConfDirective* conf = get_vhost(vhost);
+    if (!conf) {
+        return DEFAULT;
     }
     
-    SrsConfDirective* conf = get_vhost(vhost);
-
-    if (!conf) {
-        return 0;
-    }
-
     conf = conf->get("bw_limit_kbps");
     if (!conf || conf->arg0().empty()) {
-        // vhost does not specify bw_limit,
-        return 0;
+        return DEFAULT;
     }
-
+    
     return ::atoi(conf->arg0().c_str());
 }
