@@ -16,18 +16,9 @@ mkdir -p ${SRS_OBJS}/utest
 # the prefix to generate the objs/utest/Makefile
 # dirs relative to current dir(objs/utest), it's trunk/objs/utest
 # trunk of srs, which contains the src dir, relative to objs/utest, it's trunk
-SRS_TRUNK_PREFIX=../..
+SRS_TRUNK_PREFIX=../../..
 # gest dir, relative to objs/utest, it's trunk/objs/gtest
 GTEST_DIR=${SRS_TRUNK_PREFIX}/${SRS_OBJS_DIR}/gtest
-
-# the extra defines to compile utest.
-EXTRA_DEFINES=""
-
-# for osx to disable the error.
-# gtest/include/gtest/internal/gtest-port.h:499:13: fatal error: 'tr1/tuple' file not found
-if [ $SRS_OSX = YES ]; then
-    EXTRA_DEFINES="$EXTRA_DEFINES -DGTEST_HAS_TR1_TUPLE=0"
-fi
 
 cat << END > ${FILE}
 # user must run make the ${SRS_OBJS_DIR}/utest dir
@@ -54,11 +45,14 @@ GTEST_DIR = ${GTEST_DIR}
 # Where to find user code.
 USER_DIR = .
 
+# C++ compiler
+CXX = ${SRS_TOOL_CXX}
+
 # Flags passed to the preprocessor.
 CPPFLAGS += -I\$(GTEST_DIR)/include
 
 # Flags passed to the C++ compiler.
-CXXFLAGS += -g -Wall -Wextra -O0 ${EXTRA_DEFINES}
+CXXFLAGS += ${CXXFLAGS} ${UTEST_EXTRA_DEFINES} -Wno-unused-private-field -Wno-unused-command-line-argument
 
 # All tests produced by this Makefile.  Remember to add new tests you
 # created to the list.
@@ -173,13 +167,17 @@ echo "" >> ${FILE}
 echo "# link all depends libraries" >> ${FILE}
 echo -n "DEPS_LIBRARIES_FILES = " >> ${FILE}
 for item in ${ModuleLibFiles[*]}; do
-    echo -n "${SRS_TRUNK_PREFIX}/${item} " >> ${FILE}
+    if [[ -f ${item} ]]; then
+        echo -n "${SRS_TRUNK_PREFIX}/${item} " >> ${FILE}
+    else
+        echo -n "${item} " >> ${FILE}
+    fi
 done
 echo "" >> ${FILE}; echo "" >> ${FILE}
 #
 echo "# generate the utest binary" >> ${FILE}
 cat << END >> ${FILE}
-${SRS_TRUNK_PREFIX}/${SRS_OBJS_DIR}/${APP_NAME} : \$(SRS_UTEST_DEPS) ${MODULE_OBJS} gtest_main.a
+${SRS_TRUNK_PREFIX}/${SRS_OBJS_DIR}/${APP_NAME} : \$(SRS_UTEST_DEPS) ${MODULE_OBJS} gtest.a
 	\$(CXX) -o \$@ \$(CPPFLAGS) \$(CXXFLAGS) \$^ \$(DEPS_LIBRARIES_FILES) ${LINK_OPTIONS}
 END
 
@@ -187,4 +185,4 @@ END
 # parent Makefile, to create module output dir before compile it.
 echo "	@mkdir -p ${SRS_OBJS_DIR}/utest" >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
 
-echo -n "generate utest ok"; echo '!';
+echo -n "Generate utest ok"; echo '!';

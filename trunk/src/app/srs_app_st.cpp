@@ -1,243 +1,299 @@
-/*
-The MIT License (MIT)
-
-Copyright (c) 2013-2015 SRS(ossrs)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
+//
+// Copyright (c) 2013-2021 Winlin
+//
+// SPDX-License-Identifier: MIT
+//
 
 #include <srs_app_st.hpp>
 
+#include <st.h>
+#include <string>
+using namespace std;
+
 #include <srs_kernel_error.hpp>
 #include <srs_kernel_log.hpp>
+#include <srs_app_utility.hpp>
+#include <srs_app_log.hpp>
 
-SrsStSocket::SrsStSocket(st_netfd_t client_stfd)
-{
-    stfd = client_stfd;
-    send_timeout = recv_timeout = ST_UTIME_NO_TIMEOUT;
-    recv_bytes = send_bytes = 0;
-}
-
-SrsStSocket::~SrsStSocket()
+ISrsCoroutineHandler::ISrsCoroutineHandler()
 {
 }
 
-bool SrsStSocket::is_never_timeout(int64_t timeout_us)
+ISrsCoroutineHandler::~ISrsCoroutineHandler()
 {
-    return timeout_us == (int64_t)ST_UTIME_NO_TIMEOUT;
 }
 
-void SrsStSocket::set_recv_timeout(int64_t timeout_us)
+ISrsStartable::ISrsStartable()
 {
-    recv_timeout = timeout_us;
 }
 
-int64_t SrsStSocket::get_recv_timeout()
+ISrsStartable::~ISrsStartable()
 {
-    return recv_timeout;
 }
 
-void SrsStSocket::set_send_timeout(int64_t timeout_us)
+SrsCoroutine::SrsCoroutine()
 {
-    send_timeout = timeout_us;
 }
 
-int64_t SrsStSocket::get_send_timeout()
+SrsCoroutine::~SrsCoroutine()
 {
-    return send_timeout;
 }
 
-int64_t SrsStSocket::get_recv_bytes()
+SrsDummyCoroutine::SrsDummyCoroutine()
 {
-    return recv_bytes;
 }
 
-int64_t SrsStSocket::get_send_bytes()
+SrsDummyCoroutine::~SrsDummyCoroutine()
 {
-    return send_bytes;
 }
 
-int SrsStSocket::read(void* buf, size_t size, ssize_t* nread)
+srs_error_t SrsDummyCoroutine::start()
 {
-    int ret = ERROR_SUCCESS;
+    return srs_error_new(ERROR_THREAD_DUMMY, "dummy coroutine");
+}
+
+void SrsDummyCoroutine::stop()
+{
+}
+
+void SrsDummyCoroutine::interrupt()
+{
+}
+
+srs_error_t SrsDummyCoroutine::pull()
+{
+    return srs_error_new(ERROR_THREAD_DUMMY, "dummy pull");
+}
+
+const SrsContextId& SrsDummyCoroutine::cid()
+{
+    return _srs_context->get_id();
+}
+
+SrsSTCoroutine::SrsSTCoroutine(string n, ISrsCoroutineHandler* h)
+{
+    impl_ = new SrsFastCoroutine(n, h);
+}
+
+SrsSTCoroutine::SrsSTCoroutine(string n, ISrsCoroutineHandler* h, SrsContextId cid)
+{
+    impl_ = new SrsFastCoroutine(n, h, cid);
+}
+
+SrsSTCoroutine::~SrsSTCoroutine()
+{
+    srs_freep(impl_);
+}
+
+void SrsSTCoroutine::set_stack_size(int v)
+{
+    impl_->set_stack_size(v);
+}
+
+srs_error_t SrsSTCoroutine::start()
+{
+    return impl_->start();
+}
+
+void SrsSTCoroutine::stop()
+{
+    impl_->stop();
+}
+
+void SrsSTCoroutine::interrupt()
+{
+    impl_->interrupt();
+}
+
+srs_error_t SrsSTCoroutine::pull()
+{
+    return impl_->pull();
+}
+
+const SrsContextId& SrsSTCoroutine::cid()
+{
+    return impl_->cid();
+}
+
+_ST_THREAD_CREATE_PFN _pfn_st_thread_create = (_ST_THREAD_CREATE_PFN)st_thread_create;
+
+SrsFastCoroutine::SrsFastCoroutine(string n, ISrsCoroutineHandler* h)
+{
+    // TODO: FIXME: Reduce duplicated code.
+    name = n;
+    handler = h;
+    trd = NULL;
+    trd_err = srs_success;
+    started = interrupted = disposed = cycle_done = false;
+    stopping_ = false;
+
+    //  0 use default, default is 64K.
+    stack_size = 0;
+}
+
+SrsFastCoroutine::SrsFastCoroutine(string n, ISrsCoroutineHandler* h, SrsContextId cid)
+{
+    name = n;
+    handler = h;
+    cid_ = cid;
+    trd = NULL;
+    trd_err = srs_success;
+    started = interrupted = disposed = cycle_done = false;
+    stopping_ = false;
+
+    //  0 use default, default is 64K.
+    stack_size = 0;
+}
+
+SrsFastCoroutine::~SrsFastCoroutine()
+{
+    stop();
+
+    // TODO: FIXME: We must assert the cycle is done.
     
-    ssize_t nb_read = st_read(stfd, buf, size, recv_timeout);
-    if (nread) {
-        *nread = nb_read;
-    }
+    srs_freep(trd_err);
+}
+
+void SrsFastCoroutine::set_stack_size(int v)
+{
+    stack_size = v;
+}
+
+srs_error_t SrsFastCoroutine::start()
+{
+    srs_error_t err = srs_success;
     
-    // On success a non-negative integer indicating the number of bytes actually read is returned
-    // (a value of 0 means the network connection is closed or end of file is reached).
-    // Otherwise, a value of -1 is returned and errno is set to indicate the error.
-    if (nb_read <= 0) {
-        // @see https://github.com/ossrs/srs/issues/200
-        if (nb_read < 0 && errno == ETIME) {
-            return ERROR_SOCKET_TIMEOUT;
+    if (started || disposed) {
+        if (disposed) {
+            err = srs_error_new(ERROR_THREAD_DISPOSED, "disposed");
+        } else {
+            err = srs_error_new(ERROR_THREAD_STARTED, "started");
+        }
+
+        if (trd_err == srs_success) {
+            trd_err = srs_error_copy(err);
         }
         
-        if (nb_read == 0) {
-            errno = ECONNRESET;
-        }
+        return err;
+    }
+
+    if ((trd = (srs_thread_t)_pfn_st_thread_create(pfn, this, 1, stack_size)) == NULL) {
+        err = srs_error_new(ERROR_ST_CREATE_CYCLE_THREAD, "create failed");
         
-        return ERROR_SOCKET_READ;
-    }
-    
-    recv_bytes += nb_read;
-    
-    return ret;
-}
-
-int SrsStSocket::read_fully(void* buf, size_t size, ssize_t* nread)
-{
-    int ret = ERROR_SUCCESS;
-    
-    ssize_t nb_read = st_read_fully(stfd, buf, size, recv_timeout);
-    if (nread) {
-        *nread = nb_read;
-    }
-    
-    // On success a non-negative integer indicating the number of bytes actually read is returned
-    // (a value less than nbyte means the network connection is closed or end of file is reached)
-    // Otherwise, a value of -1 is returned and errno is set to indicate the error.
-    if (nb_read != (ssize_t)size) {
-        // @see https://github.com/ossrs/srs/issues/200
-        if (nb_read < 0 && errno == ETIME) {
-            return ERROR_SOCKET_TIMEOUT;
-        }
+        srs_freep(trd_err);
+        trd_err = srs_error_copy(err);
         
-        if (nb_read >= 0) {
-            errno = ECONNRESET;
+        return err;
+    }
+    
+    started = true;
+
+    return err;
+}
+
+void SrsFastCoroutine::stop()
+{
+    if (disposed) {
+        if (stopping_) {
+            srs_error("thread is stopping by %s", stopping_cid_.c_str());
+            srs_assert(!stopping_);
         }
-        
-        return ERROR_SOCKET_READ_FULLY;
+        return;
     }
+    disposed = true;
+    stopping_ = true;
     
-    recv_bytes += nb_read;
-    
-    return ret;
-}
+    interrupt();
 
-int SrsStSocket::write(void* buf, size_t size, ssize_t* nwrite)
-{
-    int ret = ERROR_SUCCESS;
-    
-    ssize_t nb_write = st_write(stfd, buf, size, send_timeout);
-    if (nwrite) {
-        *nwrite = nb_write;
-    }
-    
-    // On success a non-negative integer equal to nbyte is returned.
-    // Otherwise, a value of -1 is returned and errno is set to indicate the error.
-    if (nb_write <= 0) {
-        // @see https://github.com/ossrs/srs/issues/200
-        if (nb_write < 0 && errno == ETIME) {
-            return ERROR_SOCKET_TIMEOUT;
+    // When not started, the trd is NULL.
+    if (trd) {
+        void* res = NULL;
+        int r0 = st_thread_join((st_thread_t)trd, &res);
+        if (r0) {
+            // By st_thread_join
+            if (errno == EINVAL) srs_assert(!r0);
+            if (errno == EDEADLK) srs_assert(!r0);
+            // By st_cond_timedwait
+            if (errno == EINTR) srs_assert(!r0);
+            if (errno == ETIME) srs_assert(!r0);
+            // Others
+            srs_assert(!r0);
         }
-        
-        return ERROR_SOCKET_WRITE;
-    }
-    
-    send_bytes += nb_write;
-    
-    return ret;
-}
 
-int SrsStSocket::writev(const iovec *iov, int iov_size, ssize_t* nwrite)
-{
-    int ret = ERROR_SUCCESS;
-    
-    ssize_t nb_write = st_writev(stfd, iov, iov_size, send_timeout);
-    if (nwrite) {
-        *nwrite = nb_write;
-    }
-    
-    // On success a non-negative integer equal to nbyte is returned.
-    // Otherwise, a value of -1 is returned and errno is set to indicate the error.
-    if (nb_write <= 0) {
-        // @see https://github.com/ossrs/srs/issues/200
-        if (nb_write < 0 && errno == ETIME) {
-            return ERROR_SOCKET_TIMEOUT;
+        srs_error_t err_res = (srs_error_t)res;
+        if (err_res != srs_success) {
+            // When worker cycle done, the error has already been overrided,
+            // so the trd_err should be equal to err_res.
+            srs_assert(trd_err == err_res);
         }
-        
-        return ERROR_SOCKET_WRITE;
     }
     
-    send_bytes += nb_write;
+    // If there's no error occur from worker, try to set to terminated error.
+    if (trd_err == srs_success && !cycle_done) {
+        trd_err = srs_error_new(ERROR_THREAD_TERMINATED, "terminated");
+    }
+
+    // Now, we'are stopped.
+    stopping_ = false;
     
-    return ret;
+    return;
 }
 
-#ifdef __linux__
-#include <sys/epoll.h>
-
-bool srs_st_epoll_is_supported(void)
+void SrsFastCoroutine::interrupt()
 {
-    struct epoll_event ev;
-
-    ev.events = EPOLLIN;
-    ev.data.ptr = NULL;
-    /* Guaranteed to fail */
-    epoll_ctl(-1, EPOLL_CTL_ADD, -1, &ev);
-
-    return (errno != ENOSYS);
-}
-#endif
-
-int srs_st_init()
-{
-    int ret = ERROR_SUCCESS;
-    
-#ifdef __linux__
-    // check epoll, some old linux donot support epoll.
-    // @see https://github.com/ossrs/srs/issues/162
-    if (!srs_st_epoll_is_supported()) {
-        ret = ERROR_ST_SET_EPOLL;
-        srs_error("epoll required on Linux. ret=%d", ret);
-        return ret;
+    if (!started || interrupted || cycle_done) {
+        return;
     }
-#endif
+    interrupted = true;
     
-    // Select the best event system available on the OS. In Linux this is
-    // epoll(). On BSD it will be kqueue.
-    if (st_set_eventsys(ST_EVENTSYS_ALT) == -1) {
-        ret = ERROR_ST_SET_EPOLL;
-        srs_error("st_set_eventsys use %s failed. ret=%d", st_get_eventsys_name(), ret);
-        return ret;
+    if (trd_err == srs_success) {
+        trd_err = srs_error_new(ERROR_THREAD_INTERRUPED, "interrupted");
     }
-    srs_trace("st_set_eventsys to %s", st_get_eventsys_name());
 
-    if(st_init() != 0){
-        ret = ERROR_ST_INITIALIZE;
-        srs_error("st_init failed. ret=%d", ret);
-        return ret;
-    }
-    srs_trace("st_init success, use %s", st_get_eventsys_name());
-    
-    return ret;
+    // Note that if another thread is stopping thread and waiting in st_thread_join,
+    // the interrupt will make the st_thread_join fail.
+    st_thread_interrupt((st_thread_t)trd);
 }
 
-void srs_close_stfd(st_netfd_t& stfd)
+const SrsContextId& SrsFastCoroutine::cid()
 {
-    if (stfd) {
-        // we must ensure the close is ok.
-        int err = st_netfd_close(stfd);
-        srs_assert(err != -1);
-        stfd = NULL;
+    return cid_;
+}
+
+srs_error_t SrsFastCoroutine::cycle()
+{
+    if (_srs_context) {
+        if (cid_.empty()) {
+            cid_ = _srs_context->generate_id();
+        }
+        _srs_context->set_id(cid_);
     }
+    
+    srs_error_t err = handler->cycle();
+    if (err != srs_success) {
+        return srs_error_wrap(err, "coroutine cycle");
+    }
+
+    // Set cycle done, no need to interrupt it.
+    cycle_done = true;
+    
+    return err;
+}
+
+void* SrsFastCoroutine::pfn(void* arg)
+{
+    SrsFastCoroutine* p = (SrsFastCoroutine*)arg;
+
+    srs_error_t err = p->cycle();
+
+    // Set the err for function pull to fetch it.
+    // @see https://github.com/ossrs/srs/pull/1304#issuecomment-480484151
+    if (err != srs_success) {
+        srs_freep(p->trd_err);
+        // It's ok to directly use it, because it's returned by st_thread_join.
+        p->trd_err = err;
+    }
+
+    return (void*)err;
 }
 

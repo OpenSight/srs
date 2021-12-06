@@ -3,9 +3,9 @@
 /**
  * common utilities
  * depends: jquery1.10
- * https://code.csdn.net/snippets/147103
+ * https://gitee.com/winlinvip/codes/rpn0c2ewbomj81augzk4y59
  * @see: http://blog.csdn.net/win_lin/article/details/17994347
- * v 1.0.11
+ * v 1.0.23
  */
 
 /**
@@ -96,19 +96,76 @@ function system_array_get(arr, elem_or_function) {
 /**
  * to iterate on array.
  * @param arr the array to iterate on.
- * @param pfn the function to apply on it
+ * @param pfn the function to apply on it. return false to break loop.
  * for example,
  *      arr = [10, 15, 20, 30, 20, 40]
  *      system_array_foreach(arr, function(elem, index){
  *          console.log('index=' + index + ',elem=' + elem);
  *      });
+ * @return true when iterate all elems.
  */
 function system_array_foreach(arr, pfn) {
+    if (!pfn) {
+        return false;
+    }
+
     for (var i = 0; i < arr.length; i++) {
-        if (pfn) {
-            pfn(arr[i], i)
+        if (!pfn(arr[i], i)) {
+            return false;
         }
     }
+
+    return true;
+}
+
+/**
+ * whether the str starts with flag.
+ */
+function system_string_startswith(str, flag) {
+    if (typeof flag == "object" && flag.constructor == Array) {
+        for (var i = 0; i < flag.length; i++) {
+            if (system_string_startswith(str, flag[i])) {
+                return true;
+            }
+        }
+    }
+
+    return str && flag && str.length >= flag.length && str.indexOf(flag) == 0;
+}
+
+/**
+ * whether the str ends with flag.
+ */
+function system_string_endswith(str, flag) {
+    if (typeof flag == "object" && flag.constructor == Array) {
+        for (var i = 0; i < flag.length; i++) {
+            if (system_string_endswith(str, flag[i])) {
+                return true;
+            }
+        }
+    }
+
+    return str && flag && str.length >= flag.length && str.indexOf(flag) == str.length - flag.length;
+}
+
+/**
+ * trim the start and end of flag in str.
+ * @param flag a string to trim.
+ */
+function system_string_trim(str, flag) {
+    if (!flag || !flag.length || typeof flag != "string") {
+        return str;
+    }
+
+    while (system_string_startswith(str, flag)) {
+        str = str.substr(flag.length);
+    }
+
+    while (system_string_endswith(str, flag)) {
+        str = str.substr(0, str.length - flag.length);
+    }
+
+    return str;
 }
 
 /**
@@ -179,21 +236,44 @@ function parse_query_string(){
 
     // parse the query string.
     var query_string = String(window.location.search).replace(" ", "").split("?")[1];
-    if(query_string == undefined){
+    if(query_string === undefined){
         query_string = String(window.location.hash).replace(" ", "").split("#")[1];
-        if(query_string == undefined){
+        if(query_string === undefined){
             return obj;
         }
     }
 
-    var queries = query_string.split("&");
-    $(queries).each(function(){
-        var query = this.split("=");
-        obj[query[0]] = query[1];
-        obj.user_query[query[0]] = query[1];
-    });
+    __fill_query(query_string, obj);
 
     return obj;
+}
+
+function __fill_query(query_string, obj) {
+    // pure user query object.
+    obj.user_query = {};
+
+    if (query_string.length === 0) {
+        return;
+    }
+
+    // split again for angularjs.
+    if (query_string.indexOf("?") >= 0) {
+        query_string = query_string.split("?")[1];
+    }
+
+    var queries = query_string.split("&");
+    for (var i = 0; i < queries.length; i++) {
+        var elem = queries[i];
+
+        var query = elem.split("=");
+        obj[query[0]] = query[1];
+        obj.user_query[query[0]] = query[1];
+    }
+
+    // alias domain for vhost.
+    if (obj.domain) {
+        obj.vhost = obj.domain;
+    }
 }
 
 /**
@@ -213,10 +293,11 @@ function parse_query_string(){
 function parse_rtmp_url(rtmp_url) {
     // @see: http://stackoverflow.com/questions/10469575/how-to-use-location-object-to-parse-url-without-redirecting-the-page-in-javascri
     var a = document.createElement("a");
-    a.href = rtmp_url.replace("rtmp://", "http://").replace("?", "...").replace("=", "...");
+    a.href = rtmp_url.replace("rtmp://", "http://")
+        .replace("webrtc://", "http://")
+        .replace("rtc://", "http://");
 
     var vhost = a.hostname;
-    var port = (a.port == "")? "1935":a.port;
     var app = a.pathname.substr(1, a.pathname.lastIndexOf("/") - 1);
     var stream = a.pathname.substr(a.pathname.lastIndexOf("/") + 1);
 
@@ -236,17 +317,51 @@ function parse_rtmp_url(rtmp_url) {
 
     // when vhost equals to server, and server is ip,
     // the vhost is __defaultVhost__
-    if (a.hostname == vhost) {
+    if (a.hostname === vhost) {
         var re = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
         if (re.test(a.hostname)) {
             vhost = "__defaultVhost__";
         }
     }
+    
+    // parse the schema
+    var schema = "rtmp";
+    if (rtmp_url.indexOf("://") > 0) {
+        schema = rtmp_url.substr(0, rtmp_url.indexOf("://"));
+    }
+
+    var port = a.port;
+    if (!port) {
+        if (schema === 'http') {
+            port = 80;
+        } else if (schema === 'https') {
+            port = 443;
+        } else if (schema === 'rtmp') {
+            port = 1935;
+        }
+    }
 
     var ret = {
+        url: rtmp_url,
+        schema: schema,
         server: a.hostname, port: port,
         vhost: vhost, app: app, stream: stream
     };
+    __fill_query(a.search, ret);
+
+    // For webrtc API, we use 443 if page is https, or schema specified it.
+    if (!ret.port) {
+        if (schema === 'webrtc' || schema === 'rtc') {
+            if (ret.user_query.schema === 'https') {
+                ret.port = 443;
+            } else if (window.location.href.indexOf('https://') === 0) {
+                ret.port = 443;
+            } else {
+                // For WebRTC, SRS use 1985 as default API port.
+                ret.port = 1985;
+            }
+        }
+    }
 
     return ret;
 }
@@ -500,7 +615,14 @@ AsyncRefresh2.prototype.initialize = function(pfn, timeout) {
  * stop refresh, the refresh pfn is set to null.
  */
 AsyncRefresh2.prototype.stop = function() {
-    this.refresh_change(null, null);
+    this.__call.__enabled = false;
+}
+/**
+ * restart refresh, use previous config.
+ */
+AsyncRefresh2.prototype.restart = function() {
+    this.__call.__enabled = true;
+    this.request(0);
 }
 /**
  * change refresh pfn, the old pfn will set to disabled.
@@ -562,10 +684,3 @@ AsyncRefresh2.prototype.request = function(timeout) {
     }, timeout);
 }
 
-// other components.
-/**
- * jquery/bootstrap pager.
- * depends: jquery1.10, boostrap2
- * https://code.csdn.net/snippets/146160
- * @see: http://blog.csdn.net/win_lin/article/details/17628631
- */
