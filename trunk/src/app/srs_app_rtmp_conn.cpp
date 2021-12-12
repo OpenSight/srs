@@ -926,11 +926,11 @@ srs_error_t SrsRtmpConn::do_publishing(SrsLiveSource* source, SrsPublishRecvThre
             return srs_error_wrap(err, "rtmp: stat video frames");
         }
         nb_frames = rtrd->nb_video_frames();
-        
+
         kbps->sample();
         if(bw_limit_kbps != 0){
             if(kbps->get_recv_kbps_30s() > bw_limit_kbps){
-                ret = ERROR_SYSTEM_BANDWIDTH_DENIED;
+                err = srs_error_new(ERROR_SYSTEM_BANDWIDTH_DENIED, "rtmp: bandwidth limit reached");
                 srs_warn("Publish bandwith(%d bps) exceed the limitation(%d bps)",
                     kbps->get_recv_kbps_30s(), bw_limit_kbps);
                 break;                

@@ -2169,7 +2169,7 @@ srs_error_t SrsLiveSource::on_audio(SrsCommonMessage* shared_audio)
                    (long long)shared_audio->header.timestamp, 
                    (long long)last_packet_time - shared_audio->header.timestamp,
                    (long long)last_packet_time);
-        return ERROR_SYSTEM_PACKET_INVALID;
+        return srs_error_new(ERROR_SYSTEM_PACKET_INVALID, "invalid packet");
     }
     last_packet_time = shared_audio->header.timestamp;
     
@@ -2289,7 +2289,7 @@ srs_error_t SrsLiveSource::on_video(SrsCommonMessage* shared_video)
                    (long long)shared_video->header.timestamp, 
                    (long long)last_packet_time - shared_video->header.timestamp,
                    (long long)last_packet_time);
-        return ERROR_SYSTEM_PACKET_INVALID;
+        return srs_error_new(ERROR_SYSTEM_PACKET_INVALID, "invalid packet");
     }
     last_packet_time = shared_video->header.timestamp;
     
@@ -2552,9 +2552,6 @@ void SrsLiveSource::on_unpublish()
     // donot clear the sequence header, for it maybe not changed,
     // when drop dup sequence header, drop the metadata also.
     gop_cache->clear();
-    srs_freep(cache_metadata);
-    srs_freep(cache_sh_audio);
-    srs_freep(cache_sh_video);
 
     // Reset the metadata cache, to make VLC happy when disable/enable stream.
     // @see https://github.com/ossrs/srs/issues/1630#issuecomment-597979448
