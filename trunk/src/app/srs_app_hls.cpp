@@ -780,7 +780,7 @@ srs_error_t SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
         
         if (segment->is_sequence_header()) {
             // #EXT-X-DISCONTINUITY\n
-            ss << "#EXT-X-DISCONTINUITY" << SRS_CONSTS_LF;
+            // ss << "#EXT-X-DISCONTINUITY" << SRS_CONSTS_LF;
         }
         
         if(hls_keys && ((segment->sequence_no % hls_fragments_per_key) == 0)) {
