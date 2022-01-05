@@ -213,6 +213,7 @@ srs_error_t SrsHttpHooks::on_play(string url, SrsRequest* req)
     obj->set("stream", SrsJsonAny::str(req->stream.c_str()));
     obj->set("param", SrsJsonAny::str(req->param.c_str()));
     obj->set("pageUrl", SrsJsonAny::str(req->pageUrl.c_str()));
+    obj->set("tcUrl", SrsJsonAny::str(req->tcUrl.c_str()));
     
     std::string data = obj->dumps();
     std::string res;
