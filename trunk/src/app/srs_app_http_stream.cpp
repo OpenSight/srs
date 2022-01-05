@@ -545,6 +545,7 @@ srs_error_t SrsLiveStream::do_serve_http(ISrsHttpResponseWriter* w, ISrsHttpMess
     srs_assert(entry);
     if (srs_string_ends_with(entry->pattern, ".flv")) {
         w->header()->set_content_type("video/x-flv");
+        w->header()->set("Access-Control-Allow-Origin", "*");
         enc_desc = "FLV";
         enc = new SrsFlvStreamEncoder();
     } else if (srs_string_ends_with(entry->pattern, ".aac")) {
