@@ -86,6 +86,7 @@ private:
     // The MR(merged-write) sleep time in srs_utime_t.
     srs_utime_t mw_sleep;
     int mw_msgs;
+    int bw_limit_kbps;
     // For realtime
     // @see https://github.com/ossrs/srs/issues/257
     bool realtime;

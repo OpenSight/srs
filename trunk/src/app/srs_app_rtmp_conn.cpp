@@ -877,6 +877,8 @@ srs_error_t SrsRtmpConn::do_publishing(SrsLiveSource* source, SrsPublishRecvThre
     publish_1stpkt_timeout = _srs_config->get_publish_1stpkt_timeout(req->vhost);
     publish_normal_timeout = _srs_config->get_publish_normal_timeout(req->vhost);
     
+    bw_limit_kbps = _srs_config->get_bw_limit_kbps(req->vhost);
+    
     // set the sock options.
     set_sock_options();
     
@@ -924,10 +926,19 @@ srs_error_t SrsRtmpConn::do_publishing(SrsLiveSource* source, SrsPublishRecvThre
             return srs_error_wrap(err, "rtmp: stat video frames");
         }
         nb_frames = rtrd->nb_video_frames();
+        
+        kbps->sample();
+        if(bw_limit_kbps != 0){
+            if(kbps->get_recv_kbps_30s() > bw_limit_kbps){
+                err = srs_error_new(ERROR_SYSTEM_BANDWIDTH_DENIED, "rtmp: bandwidth limit reached");
+                srs_warn("Publish bandwith(%d bps) exceed the limitation(%d bps)",
+                    kbps->get_recv_kbps_30s(), bw_limit_kbps);
+                break;                
+            }
+        }
 
         // reportable
         if (pprint->can_print()) {
-            kbps->sample();
             bool mr = _srs_config->get_mr_enabled(req->vhost);
             srs_utime_t mr_sleep = _srs_config->get_mr_sleep(req->vhost);
             srs_trace("<- " SRS_CONSTS_LOG_CLIENT_PUBLISH " time=%d, okbps=%d,%d,%d, ikbps=%d,%d,%d, mr=%d/%d, p1stpt=%d, pnt=%d",

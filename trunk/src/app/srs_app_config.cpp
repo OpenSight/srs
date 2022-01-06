@@ -7278,3 +7278,24 @@ SrsConfDirective* SrsConfig::get_stats_disk_device()
     
     return conf;
 }
+
+int SrsConfig::get_bw_limit_kbps(string vhost)
+{
+    static int DEFAULT = 0;
+
+    if (vhost.empty()) {
+        return DEFAULT;
+    }
+
+    SrsConfDirective* conf = get_vhost(vhost);
+    if (!conf) {
+        return DEFAULT;
+    }
+    
+    conf = conf->get("bw_limit_kbps");
+    if (!conf || conf->arg0().empty()) {
+        return DEFAULT;
+    }
+    
+    return ::atoi(conf->arg0().c_str());
+}

@@ -1036,7 +1036,14 @@ public:
 private:
     // Get the stats directive.
     virtual SrsConfDirective* get_stats();
-public:
+public:    
+    /**
+    * get bw_limit.
+    * @param vhost, the vhost to get the chunk size. use global if not specified.
+    *       empty string to get the global.
+    * @remark, default 0, means no limit
+    */
+    virtual int get_bw_limit_kbps(std::string vhost);
     // Whether enabled stats.
     virtual bool get_stats_enabled();
     // Get the network device index, used to retrieve the ip of device,
