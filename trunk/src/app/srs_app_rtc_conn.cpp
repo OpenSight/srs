@@ -2610,7 +2610,7 @@ srs_error_t SrsRtcConnection::send_rtcp_remb(uint32_t ssrc, const uint64_t& bitr
     //SSRC feedback
     stream.write_4bytes(ssrc);
     
-    srs_trace("RTCP REMB ssrc=%u, bitrate=%llu, size=%d", ssrc, bitrate, stream.pos());
+    srs_info("RTCP REMB ssrc=%u, bitrate=%llu, size=%d", ssrc, bitrate, stream.pos());
     
     int nb_protected_buf = stream.pos();
     if ((err = transport_->protect_rtcp(stream.data(), &nb_protected_buf)) != srs_success) {
