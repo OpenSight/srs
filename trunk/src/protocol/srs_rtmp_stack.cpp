@@ -1522,6 +1522,8 @@ SrsRequest::SrsRequest()
     duration = -1;
     port = SRS_CONSTS_RTMP_DEFAULT_PORT;
     args = NULL;
+	
+	bitrate = 0;
 }
 
 SrsRequest::~SrsRequest()
@@ -1549,6 +1551,7 @@ SrsRequest* SrsRequest::copy()
     if (args) {
         cp->args = args->copy()->to_object();
     }
+	cp->bitrate = bitrate;
     
     return cp;
 }
@@ -1576,6 +1579,8 @@ void SrsRequest::update_auth(SrsRequest* req)
     if (req->args) {
         args = req->args->copy()->to_object();
     }
+
+	bitrate = req->bitrate;
     
     srs_info("update req of soruce for auth ok");
 }

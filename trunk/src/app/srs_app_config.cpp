@@ -2841,7 +2841,7 @@ srs_error_t SrsConfig::check_normal_config()
                     if (m != "enabled" && m != "nack" && m != "twcc" && m != "nack_no_copy"
                         && m != "bframe" && m != "aac" && m != "stun_timeout" && m != "stun_strict_check"
                         && m != "dtls_role" && m != "dtls_version" && m != "drop_for_pt" && m != "rtc_to_rtmp"
-                        && m != "pli_for_rtmp" && m != "rtmp_to_rtc" && m != "keep_bframe") {
+                        && m != "pli_for_rtmp" && m != "rtmp_to_rtc" && m != "keep_bframe" && m != "bitrate") {
                         return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "illegal vhost.rtc.%s of %s", m.c_str(), vhost->arg0().c_str());
                     }
                 }
@@ -3870,6 +3870,34 @@ bool SrsConfig::get_rtc_to_rtmp(string vhost)
     return SRS_CONF_PERFER_FALSE(conf->arg0());
 }
 
+uint64_t SrsConfig::get_rtc_bitrate(string vhost)
+{
+    static uint64_t DEFAULT = 0;
+
+    SrsConfDirective* conf = get_rtc(vhost);
+    if (!conf) {
+        return DEFAULT;
+    }
+
+    conf = conf->get("bitrate");
+    if (!conf || conf->arg0().empty()) {
+        return DEFAULT;
+    }
+
+    uint64_t v = (uint64_t)(::atoll(conf->arg0().c_str()));
+    if ( v > 100 * 1024 * 1024) {
+        srs_warn("Invalid bitrate(%ll), No bitrate control", (long long) v);
+        return DEFAULT;
+    }
+    
+    if (v < 64000){
+        
+        srs_warn("Invalid bitrate(%ll), reset it to 64000 bps", (long long) v);
+		v = 64000;
+    }
+
+    return v;
+}
 srs_utime_t SrsConfig::get_rtc_pli_for_rtmp(string vhost)
 {
     static srs_utime_t DEFAULT = 6 * SRS_UTIME_SECONDS;

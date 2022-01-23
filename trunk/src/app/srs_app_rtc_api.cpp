@@ -381,6 +381,12 @@ srs_error_t SrsGoApiRtcPublish::do_serve_http(ISrsHttpResponseWriter* w, ISrsHtt
         tid = prop->to_str();
     }
 
+    uint64_t bitrate = 0;
+    if ((prop = req->ensure_property_integer("bitrate")) != NULL) {
+        bitrate = prop->to_integer();
+    }
+
+
     // The RTC user config object.
     SrsRtcUserConfig ruc;
     ruc.req_->ip = clientip;
@@ -408,15 +414,30 @@ srs_error_t SrsGoApiRtcPublish::do_serve_http(ISrsHttpResponseWriter* w, ISrsHtt
     }
     string codec = r->query_get("codec");
 
-    srs_trace("RTC publish %s, api=%s, tid=%s, clientip=%s, app=%s, stream=%s, offer=%dB, eip=%s, codec=%s",
+    string bitrate_query = r->query_get("bitrate");
+    if(bitrate == 0 && ! bitrate_query.empty()){
+        bitrate = ::atoll(bitrate_query.c_str());
+    }
+	if (bitrate > 100 * 1024 * 1024) {
+        srs_warn("Request Invalid bitrate(%ll), No bitrate control", (long long)bitrate);
+        bitrate = 0;
+    }    
+    if (bitrate < 64000 && bitrate > 0){
+        srs_warn("Request Invalid bitrate(%ll), reset it to 64000 bps", (long long)bitrate);
+		bitrate = 64000;
+    }
+
+    srs_trace("RTC publish %s, api=%s, tid=%s, clientip=%s, app=%s, stream=%s, offer=%dB, eip=%s, codec=%s, bitrate=%llu",
         streamurl.c_str(), api.c_str(), tid.c_str(), clientip.c_str(), ruc.req_->app.c_str(), ruc.req_->stream.c_str(),
-        remote_sdp_str.length(), eip.c_str(), codec.c_str()
+        remote_sdp_str.length(), eip.c_str(), codec.c_str(), bitrate
     );
 
     ruc.eip_ = eip;
     ruc.codec_ = codec;
     ruc.publish_ = true;
     ruc.dtls_ = ruc.srtp_ = true;
+
+    ruc.req_->bitrate = bitrate;
 
     // TODO: FIXME: It seems remote_sdp doesn't represents the full SDP information.
     if ((err = ruc.remote_sdp_.parse(remote_sdp_str)) != srs_success) {
