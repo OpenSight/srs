@@ -741,6 +741,7 @@ srs_error_t SrsLiveStream::do_serve_http(SrsLiveSource* source, SrsLiveConsumer*
 
     if (srs_string_ends_with(entry->pattern, ".flv")) {
         w->header()->set_content_type("video/x-flv");
+        w->header()->set("Access-Control-Allow-Origin", "*");
         enc_desc = "FLV";
         enc_raw = new SrsFlvStreamEncoder();
         ((SrsFlvStreamEncoder*)enc_raw)->set_drop_if_not_match(drop_if_not_match);
