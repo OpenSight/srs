@@ -436,6 +436,9 @@ public:
     // used for edge traverse to origin authentication,
     // @see https://github.com/ossrs/srs/issues/104
     SrsAmf0Object* args;
+
+    //the max bitrate for client
+    uint64_t bitrate;
 public:
     SrsRequest();
     virtual ~SrsRequest();
