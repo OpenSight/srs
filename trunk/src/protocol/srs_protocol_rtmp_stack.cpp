@@ -1463,6 +1463,8 @@ SrsRequest::SrsRequest()
     args = NULL;
 
     protocol = "rtmp";
+	
+	bitrate = 0;
 }
 
 SrsRequest::~SrsRequest()
@@ -1492,6 +1494,7 @@ SrsRequest* SrsRequest::copy()
     }
 
     cp->protocol = protocol;
+	cp->bitrate = bitrate;
     
     return cp;
 }
@@ -1521,6 +1524,8 @@ void SrsRequest::update_auth(SrsRequest* req)
     }
 
     protocol = req->protocol;
+
+	bitrate = req->bitrate;
     
     srs_info("update req of soruce for auth ok");
 }

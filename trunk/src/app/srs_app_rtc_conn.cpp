@@ -986,6 +986,12 @@ srs_error_t SrsRtcPublishRtcpTimer::on_timer(srs_utime_t interval)
         srs_warn("XR err %s", srs_error_desc(err).c_str());
         srs_freep(err);
     }
+    
+    // For REMB
+    if((err = p_->send_rtcp_remb()) != srs_success){
+        srs_warn("remb err %s", srs_error_desc(err).c_str());
+        srs_freep(err);        
+    }
 
     return err;
 }
@@ -1117,6 +1123,9 @@ SrsRtcPublishStream::SrsRtcPublishStream(SrsRtcConnection* session, const SrsCon
     
     pli_worker_ = new SrsRtcPLIWorker(this);
     last_time_send_twcc_ = 0;
+    
+    bitrate_ = 0;
+    remb_startup_ = 4;
 
     timer_rtcp_ = new SrsRtcPublishRtcpTimer(this);
     timer_twcc_ = new SrsRtcPublishTwccTimer(this);
@@ -1199,6 +1208,12 @@ srs_error_t SrsRtcPublishStream::initialize(SrsRequest* r, SrsRtcSourceDescripti
     pt_to_drop_ = (uint16_t)_srs_config->get_rtc_drop_for_pt(req_->vhost);
     twcc_enabled_ = _srs_config->get_rtc_twcc_enabled(req_->vhost);
 
+    bitrate_ = _srs_config->get_rtc_bitrate(req_->vhost);
+    if(r->bitrate != 0){
+        bitrate_ = r->bitrate;		
+    }	
+    remb_startup_ = 4;
+    
     // No TWCC when negotiate, disable it.
     if (twcc_id <= 0) {
         twcc_enabled_ = false;
@@ -1355,6 +1370,43 @@ srs_error_t SrsRtcPublishStream::send_rtcp_rr()
     return err;
 }
 
+
+srs_error_t SrsRtcPublishStream::send_rtcp_remb()
+{
+    srs_error_t err = srs_success;
+    uint32_t bitrate = bitrate_;
+    
+    // no bitrate control
+    if(bitrate_ == 0){
+        return err;
+    }
+    
+    // no rtc session
+    if(session_ == NULL){
+        return err;
+    }
+    
+    // no video tracks
+    if(video_tracks_.size() == 0){
+        return err;
+    }
+    
+    if(remb_startup_ > 0){
+        bitrate = bitrate / remb_startup_;
+        remb_startup_ --;
+    }
+	
+    //only send for video 0 track
+    SrsRtcVideoRecvTrack* track = video_tracks_.at(0);
+    uint32_t ssrc = track->get_ssrc();
+    if ((err = session_->send_rtcp_remb(ssrc, bitrate) ) != srs_success) {
+        return srs_error_wrap(err, "rtcp remb send error(ssrc=%u, bitrate=%llu)" , ssrc, (unsigned long long)bitrate);
+    }
+
+
+    return err;
+}
+
 srs_error_t SrsRtcPublishStream::send_rtcp_xr_rrtr()
 {
     srs_error_t err = srs_success;
@@ -1479,6 +1531,16 @@ srs_error_t SrsRtcPublishStream::do_on_rtp_plaintext(SrsRtpPacket*& pkt, SrsBuff
         }
     } else {
         return srs_error_new(ERROR_RTC_RTP, "unknown ssrc=%u", ssrc);
+    }
+
+    // For remb startup, according to janus
+    if(video_track != NULL && bitrate_ != 0 && remb_startup_ > 0){
+        
+        if ((err = send_rtcp_remb()) != srs_success) {
+            srs_warn("send rtcp remb failed, %s", srs_error_desc(err).c_str());
+            srs_freep(err);
+        }
+
     }
 
     // If circuit-breaker is enabled, disable nack.
@@ -2370,6 +2432,56 @@ void SrsRtcConnection::check_send_nacks(SrsRtpNackForReceiver* nack, uint32_t ss
     send_rtcp(stream.data(), stream.pos());
 }
 
+srs_error_t SrsRtcConnection::send_rtcp_remb(uint32_t ssrc, const uint64_t& bitrate)
+{
+    srs_error_t err = srs_success;
+    int min_len = 20 + 4;
+    
+    // @see https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03#section-2.2
+    char buf[kRtpPacketSize];
+    SrsBuffer stream(buf, sizeof(buf));
+    //header
+    stream.write_1bytes(0x8F);
+    stream.write_1bytes(kPsFb);
+    stream.write_2bytes((min_len/4) - 1);
+    //SSRC of packet sender      
+    stream.write_4bytes(ssrc); // TODO: FIXME: Should be 1?
+    //SSRC of media source, always 0
+    stream.write_4bytes(0);
+    
+    //Unique identifier (32 bits):  Always 'R' 'E' 'M' 'B' (4 ASCII characters).
+    stream.write_1bytes('R');
+    stream.write_1bytes('E');
+    stream.write_1bytes('M');
+    stream.write_1bytes('B');    
+    
+    //Num SSRC (8 bits)
+    stream.write_1bytes(1);
+    
+	/* bitrate --> brexp/brmantissa */
+	uint8_t b = 0;
+	uint8_t newbrexp = 0;
+	uint32_t newbrmantissa = 0;
+	for(b=0; b<32; b++) {
+		if(bitrate <= ((uint32_t) 0x3FFFF << b)) {
+			newbrexp = b;
+			break;
+		}
+	}
+	if(b > 31)
+		b = 31;
+	newbrmantissa = bitrate >> b;
+    // BR Exp (6 bits) + BR Mantissa (18 bits)
+    stream.write_1bytes((uint8_t)((newbrexp << 2) + ((newbrmantissa >> 16) & 0x03)));
+    stream.write_1bytes((uint8_t)(newbrmantissa >> 8));
+    stream.write_1bytes((uint8_t)(newbrmantissa));
+    
+    //SSRC feedback
+    stream.write_4bytes(ssrc);
+
+    return send_rtcp(stream.data(), stream.pos());
+}
+
 srs_error_t SrsRtcConnection::send_rtcp_rr(uint32_t ssrc, SrsRtpRingBuffer* rtp_queue, const uint64_t& last_send_systime, const SrsNtp& last_send_ntp)
 {
     ++_srs_pps_srtcps->sugar;
@@ -2651,6 +2763,10 @@ srs_error_t SrsRtcConnection::negotiate_publish_capability(SrsRtcUserConfig* ruc
 
     bool nack_enabled = _srs_config->get_rtc_nack_enabled(req->vhost);
     bool twcc_enabled = _srs_config->get_rtc_twcc_enabled(req->vhost);
+	
+    bool remb_enabled = _srs_config->get_rtc_bitrate(req->vhost) > 0 || 
+                        req->bitrate > 0;
+
     // TODO: FIME: Should check packetization-mode=1 also.
     bool has_42e01f = srs_sdp_has_h264_profile(remote_sdp, "42e01f");
 
@@ -2751,6 +2867,11 @@ srs_error_t SrsRtcConnection::negotiate_publish_capability(SrsRtcUserConfig* ruc
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
                     }
+                    if(remb_enabled) {
+                        if (rtcp_fb == "goog-remb") {
+                            video_payload->rtcp_fbs_.push_back(rtcp_fb);
+                        }                        
+                    }
                 }
 
                 track_desc->type_ = "video";
@@ -2784,6 +2905,11 @@ srs_error_t SrsRtcConnection::negotiate_publish_capability(SrsRtcUserConfig* ruc
                         if (rtcp_fb == "transport-cc") {
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
+                    }
+                    if(remb_enabled) {
+                        if (rtcp_fb == "goog-remb") {
+                            video_payload->rtcp_fbs_.push_back(rtcp_fb);
+                        }                        
                     }
                 }
 
@@ -2836,6 +2962,11 @@ srs_error_t SrsRtcConnection::negotiate_publish_capability(SrsRtcUserConfig* ruc
                                 video_payload->rtcp_fbs_.push_back(rtcp_fb);
                             }
                         }
+                        if(remb_enabled) {
+                            if (rtcp_fb == "goog-remb") {
+                                video_payload->rtcp_fbs_.push_back(rtcp_fb);
+                            }                        
+                        }
                     }
 
                     track_desc->type_ = "video";
@@ -2872,6 +3003,11 @@ srs_error_t SrsRtcConnection::negotiate_publish_capability(SrsRtcUserConfig* ruc
                         if (rtcp_fb == "transport-cc") {
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
+                    }
+                    if(remb_enabled) {
+                        if (rtcp_fb == "goog-remb") {
+                            video_payload->rtcp_fbs_.push_back(rtcp_fb);
+                        }                        
                     }
                 }
 
