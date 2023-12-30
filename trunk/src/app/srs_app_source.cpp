@@ -40,6 +40,8 @@ using namespace std;
 #define CONST_MAX_JITTER_MS_NEG         -250
 #define DEFAULT_FRAME_TIME_MS         10
 
+#define CONST_MAX_FRAME_INTERVAL_MS    5000
+
 // for 26ms per audio packet,
 // 115 packets is 3s.
 #define SRS_PURE_AUDIO_GUESS_COUNT 115
@@ -2238,6 +2240,13 @@ srs_error_t SrsLiveSource::on_audio(SrsCommonMessage* shared_audio)
                      last_packet_time, shared_audio->header.timestamp);
         }
     }
+    if(last_packet_time > 0 && shared_audio->header.timestamp < last_packet_time - CONST_MAX_FRAME_INTERVAL_MS){
+        srs_error("AUDIO: frame's timestamp(%lld ms) is %lld ms less than last timestamp(%lld ms)",
+                   (long long)shared_audio->header.timestamp, 
+                   (long long)last_packet_time - shared_audio->header.timestamp,
+                   (long long)last_packet_time);
+        return srs_error_new(ERROR_SYSTEM_PACKET_INVALID, "invalid packet");
+    }
     last_packet_time = shared_audio->header.timestamp;
 
     // convert shared_audio to msg, user should not use shared_audio again.
@@ -2371,6 +2380,13 @@ srs_error_t SrsLiveSource::on_video(SrsCommonMessage* shared_video)
             srs_warn("VIDEO: Timestamp %" PRId64 "=>%" PRId64 ", may need mix_correct.",
                      last_packet_time, shared_video->header.timestamp);
         }
+    }
+    if(last_packet_time > 0 && shared_video->header.timestamp < last_packet_time - CONST_MAX_FRAME_INTERVAL_MS){
+        srs_error("VIDEO: frame's timestamp(%lld ms) is %lld ms less than last timestamp(%lld ms)",
+                   (long long)shared_video->header.timestamp, 
+                   (long long)last_packet_time - shared_video->header.timestamp,
+                   (long long)last_packet_time);
+        return srs_error_new(ERROR_SYSTEM_PACKET_INVALID, "invalid packet");
     }
     last_packet_time = shared_video->header.timestamp;
 
