@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2013-2023 The SRS Authors
+// Copyright (c) 2013-2024 The SRS Authors
 //
 // SPDX-License-Identifier: MIT
 //
@@ -87,6 +87,9 @@ extern void srs_free_global_system_ips();
 #ifdef SRS_SANITIZER_LOG
 extern void asan_report_callback(const char* str);
 #endif
+
+extern SrsPps* _srs_pps_cids_get;
+extern SrsPps* _srs_pps_cids_set;
 
 /**
  * main entrance.
@@ -521,6 +524,10 @@ srs_error_t run_hybrid_server(void* /*arg*/)
 
     // After all done, stop and cleanup.
     _srs_hybrid->stop();
+
+    // Dispose all global objects, note that we should do this in the hybrid thread, because it may
+    // depend on the ST when disposing.
+    srs_global_dispose();
 
     return err;
 }

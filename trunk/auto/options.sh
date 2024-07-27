@@ -6,7 +6,7 @@ help=no
 SRS_HDS=NO
 SRS_SRT=YES
 SRS_RTC=YES
-SRS_H265=NO
+SRS_H265=YES
 SRS_GB28181=NO
 SRS_CXX11=YES
 SRS_CXX14=NO
@@ -84,7 +84,7 @@ SRS_BUILD_TAG= # Set the object files tag name.
 SRS_CLEAN=YES # Whether do "make clean" when configure.
 SRS_SIMULATOR=NO # Whether enable RTC simulate API.
 SRS_GENERATE_OBJS=NO # Whether generate objs and quit.
-SRS_SINGLE_THREAD=NO # Whether force single thread mode.
+SRS_SINGLE_THREAD=YES # Whether force single thread mode.
 #
 ################################################################
 # Performance options.

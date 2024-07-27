@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2013-2023 The SRS Authors
+// Copyright (c) 2013-2024 The SRS Authors
 //
 // SPDX-License-Identifier: MIT
 //
@@ -123,7 +123,7 @@ private:
     SrsCoroutine* trd_;
 
     SrsRequest* req_;
-    SrsSrtSource* srt_source_;
+    SrsSharedPtr<SrsSrtSource> srt_source_;
     SrsSecurity* security_;
 };
 
