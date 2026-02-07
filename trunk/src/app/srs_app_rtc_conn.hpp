@@ -342,7 +342,8 @@ private:
     bool nack_no_copy_;
     bool twcc_enabled_;
     uint64_t bitrate_;
-    uint64_t remb_startup_;
+    int remb_startup_;
+    srs_mutex_t lock_remb_;
 private:
     bool request_keyframe_;
     SrsErrorPithyPrint* pli_epp;

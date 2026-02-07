@@ -1126,6 +1126,7 @@ SrsRtcPublishStream::SrsRtcPublishStream(SrsRtcConnection* session, const SrsCon
     
     bitrate_ = 0;
     remb_startup_ = 4;
+    lock_remb_ = srs_mutex_new();
 
     timer_rtcp_ = new SrsRtcPublishRtcpTimer(this);
     timer_twcc_ = new SrsRtcPublishTwccTimer(this);
@@ -1137,6 +1138,7 @@ SrsRtcPublishStream::~SrsRtcPublishStream()
         session_->server_->exec_async_work(new SrsRtcAsyncCallOnUnpublish(cid_, req_));
     }
 
+    srs_mutex_destroy(lock_remb_);
     srs_freep(timer_rtcp_);
     srs_freep(timer_twcc_);
 
@@ -1374,6 +1376,10 @@ srs_error_t SrsRtcPublishStream::send_rtcp_rr()
 srs_error_t SrsRtcPublishStream::send_rtcp_remb()
 {
     srs_error_t err = srs_success;
+    
+    // Serialize access from both timer and per-packet paths.
+    SrsLocker(lock_remb_);
+    
     uint32_t bitrate = bitrate_;
     
     // no bitrate control
@@ -1402,7 +1408,6 @@ srs_error_t SrsRtcPublishStream::send_rtcp_remb()
     if ((err = session_->send_rtcp_remb(ssrc, bitrate) ) != srs_success) {
         return srs_error_wrap(err, "rtcp remb send error(ssrc=%u, bitrate=%llu)" , ssrc, (unsigned long long)bitrate);
     }
-
 
     return err;
 }
