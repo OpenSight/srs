@@ -4667,13 +4667,13 @@ uint64_t SrsConfig::get_rtc_bitrate(string vhost)
 
     uint64_t v = (uint64_t)(::atoll(conf->arg0().c_str()));
     if ( v > 100 * 1024 * 1024) {
-        srs_warn("Invalid bitrate(%ll), No bitrate control", (long long) v);
+        srs_warn("Invalid bitrate(%llu), No bitrate control", (unsigned long long) v);
         return DEFAULT;
     }
     
     if (v < 64000){
         
-        srs_warn("Invalid bitrate(%ll), reset it to 64000 bps", (long long) v);
+        srs_warn("Invalid bitrate(%llu), reset it to 64000 bps", (unsigned long long) v);
 		v = 64000;
     }
 

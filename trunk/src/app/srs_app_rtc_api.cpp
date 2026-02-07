@@ -468,11 +468,11 @@ srs_error_t SrsGoApiRtcPublish::do_serve_http(ISrsHttpResponseWriter* w, ISrsHtt
         bitrate = ::atoll(bitrate_query.c_str());
     }
 	if (bitrate > 100 * 1024 * 1024) {
-        srs_warn("Request Invalid bitrate(%ll), No bitrate control", (long long)bitrate);
+        srs_warn("Request Invalid bitrate(%llu), No bitrate control", (unsigned long long)bitrate);
         bitrate = 0;
     }    
     if (bitrate < 64000 && bitrate > 0){
-        srs_warn("Request Invalid bitrate(%ll), reset it to 64000 bps", (long long)bitrate);
+        srs_warn("Request Invalid bitrate(%llu), reset it to 64000 bps", (unsigned long long)bitrate);
 		bitrate = 64000;
     }
 
