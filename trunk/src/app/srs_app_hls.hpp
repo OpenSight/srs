@@ -170,6 +170,11 @@ private:
     // and uses the regular PMT refresh. Only the startup audio-only segment is
     // provisional and may be discarded to correct its initial program map.
     bool video_established_;
+    // Whether any segment has already been published to the playlist in this
+    // publish session. An audio-only prelude may advertise segments before the
+    // first video frame, so from then on the current segment holds established
+    // media and must never be discarded for a provisional codec correction.
+    bool segment_advertised_;
 public:
     SrsHlsMuxer();
     virtual ~SrsHlsMuxer();

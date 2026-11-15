@@ -206,6 +206,7 @@ SrsHlsMuxer::SrsHlsMuxer()
     latest_vcodec_ = SrsVideoCodecIdForbidden;
     current_written_ = false;
     video_established_ = false;
+    segment_advertised_ = false;
 
     memset(key, 0, 16);
     memset(iv, 0, 16);
@@ -320,8 +321,9 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
 
     // Once real video media has been written, the segment is established. A
     // later codec change keeps that media and uses the regular PMT refresh.
-    // Only the startup segment before the first video frame is provisional.
-    if (video_established_) {
+    // The same applies after an audio-only prelude has published a segment:
+    // that media is already established even before the first video frame.
+    if (video_established_ || segment_advertised_) {
         set_latest_vcodec(vcodec);
         return err;
     }
@@ -375,6 +377,7 @@ srs_error_t SrsHlsMuxer::on_publish(SrsRequest* req)
     srs_error_t err = srs_success;
 
     video_established_ = false;
+    segment_advertised_ = false;
 
     if ((err = async->start()) != srs_success) {
         return srs_error_wrap(err, "async start");
@@ -759,6 +762,7 @@ srs_error_t SrsHlsMuxer::do_segment_close()
         srs_freep(current->tscw);
 
         segments->append(current);
+        segment_advertised_ = true;
         current = NULL;
     } else {
         // reuse current segment index.
