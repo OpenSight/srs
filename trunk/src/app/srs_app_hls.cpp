@@ -304,7 +304,7 @@ void SrsHlsMuxer::set_latest_vcodec(SrsVideoCodecId v)
     latest_vcodec_ = v;
 }
 
-srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
+srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec, int64_t dts)
 {
     srs_error_t err = srs_success;
 
@@ -333,6 +333,22 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
     // the first video packet, so no advertised video segment starts with the
     // provisional program map.
     if (segment_advertised_) {
+        // The overflow reap may have flushed a single audio frame into this
+        // segment, recording only its start DTS. Its measured duration is zero
+        // until another audio frame arrives. A sequence header alone has no
+        // timestamp, so wait for write_video to pass the first video DTS as
+        // the segment boundary instead of advertising an EXTINF of zero. The
+        // writer keeps the provisional codec until this decision, so the first
+        // video frame reaches this branch and is never written into the
+        // provisional segment.
+        if (current->duration() == 0) {
+            if (dts < 0) {
+                return err;
+            }
+
+            update_duration(dts);
+        }
+
         srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
             vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current->duration()));
 
@@ -1111,9 +1127,9 @@ srs_error_t SrsHlsController::on_sequence_header()
     return muxer->on_sequence_header();
 }
 
-srs_error_t SrsHlsController::update_video_codec(SrsVideoCodecId vcodec)
+srs_error_t SrsHlsController::update_video_codec(SrsVideoCodecId vcodec, int64_t dts)
 {
-    return muxer->update_video_codec(vcodec);
+    return muxer->update_video_codec(vcodec, dts);
 }
 
 srs_error_t SrsHlsController::write_audio(SrsAudioFrame* frame, int64_t pts)
@@ -1175,7 +1191,7 @@ srs_error_t SrsHlsController::write_video(SrsVideoFrame* frame, int64_t dts)
     if (muxer->latest_vcodec() != frame->vcodec()->id) {
         srs_trace("HLS: Switch video codec %d(%s) to %d(%s)", muxer->latest_vcodec(), srs_video_codec_id2str(muxer->latest_vcodec()).c_str(),
                   frame->vcodec()->id, srs_video_codec_id2str(frame->vcodec()->id).c_str());
-        if ((err = muxer->update_video_codec(frame->vcodec()->id)) != srs_success) {
+        if ((err = muxer->update_video_codec(frame->vcodec()->id, dts)) != srs_success) {
             return srs_error_wrap(err, "hls: update video codec");
         }
     }

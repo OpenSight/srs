@@ -197,8 +197,11 @@ public:
     // audio-only segment has been advertised, the current audio-only segment is
     // finalized as its own media and a new segment is opened with the real
     // codec; once video media has been written the segment is established and
-    // kept.
-    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
+    // kept. When the audio-only segment has no measured duration yet, dts is
+    // the first video timestamp used as its segment boundary; a negative value
+    // means the codec was learned from a sequence header before any video media
+    // and the rotation waits for write_video to supply the boundary.
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec, int64_t dts = -1);
 public:
     // Initialize the hls muxer.
     virtual srs_error_t initialize();
@@ -291,8 +294,10 @@ public:
     // @see: 3.4.11.  EXT-X-DISCONTINUITY
     virtual srs_error_t on_sequence_header();
     // Apply the video codec learned from a sequence header before any media
-    // frame writes the initial PMT of the startup segment.
-    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
+    // frame writes the initial PMT of the startup segment. dts is the first
+    // video timestamp when the caller has one, used as the boundary of an
+    // audio-only segment whose measured duration is still zero.
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec, int64_t dts = -1);
     // write audio to cache, if need to flush, flush to muxer.
     virtual srs_error_t write_audio(SrsAudioFrame* frame, int64_t pts);
     // write video to muxer.

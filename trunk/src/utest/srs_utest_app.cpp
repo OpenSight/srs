@@ -1601,3 +1601,138 @@ VOID TEST(HlsControllerTest, AudioOnlyPreludeThenVideoStartsWithHevcPmt)
     }
 }
 
+// The natural absolute overflow reaps the prelude and flushes the triggering
+// audio aggregate into the new segment. Until another audio frame arrives that
+// segment has only the aggregate's start DTS, so its measured duration is zero.
+// Discovering HEVC in that exact window must not advertise an EXTINF of zero:
+// the retained audio segment needs a positive, truthful duration and the next
+// segment must start with the real codec before the first video packet.
+VOID TEST(HlsControllerTest, AudioOverflowBoundaryDiscoveryKeepsPositiveDuration)
+{
+    srs_error_t err = srs_success;
+
+    std::stringstream dir_ss;
+    dir_ss << _srs_tmp_file_prefix << "issue70-boundary-controller-" << srs_update_system_time();
+    std::string dir = dir_ss.str();
+    std::stringstream conf_ss;
+    conf_ss << "listen 1935;"
+            << "vhost __defaultVhost__ {"
+            << "    hls {"
+            << "        enabled on;"
+            << "        hls_path " << dir << ";"
+            << "        hls_fragment 1;"
+            << "        hls_window 60;"
+            << "        hls_ts_file [stream]-[seq].ts;"
+            << "        hls_m3u8_file [stream].m3u8;"
+            << "    }"
+            << "}";
+    std::string conf_str = conf_ss.str();
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(conf_str.c_str()));
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsHlsController controller;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "boundary-controller";
+
+    HELPER_ASSERT_SUCCESS(controller.on_publish(&req));
+
+    SrsAudioCodecConfig acodec;
+    acodec.id = SrsAudioCodecIdAAC;
+    acodec.aac_object = SrsAacObjectTypeAacLC;
+    acodec.aac_sample_rate = 3;
+    acodec.aac_channels = 2;
+
+    SrsAudioFrame aframe;
+    HELPER_ASSERT_SUCCESS(aframe.initialize(&acodec));
+    char abytes[1024];
+    memset(abytes, 0x55, sizeof(abytes));
+    HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
+
+    std::string m3u8 = dir + "/boundary-controller.m3u8";
+
+    // Write audio until the natural absolute overflow advertises the first
+    // audio-only prelude segment. The triggering aggregate is flushed into the
+    // new current segment by that same write.
+    int64_t pts = 0;
+    int writes = 0;
+    for (; writes < 600; writes++) {
+        HELPER_ASSERT_SUCCESS(controller.write_audio(&aframe, pts));
+        pts += 1920;
+        if (srs_ut70_read_file(m3u8).find("#EXTINF") != std::string::npos) {
+            break;
+        }
+    }
+    ASSERT_TRUE(writes < 600);
+
+    std::vector<std::pair<double, std::string> > advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_EQ(1, (int)advertised.size());
+    std::string prelude_uri = advertised.at(0).second;
+
+    // The new segment holds the flushed aggregate but has not been advertised
+    // and has not advanced its duration with a later audio frame.
+    std::string audio_uri = controller.ts_url();
+    EXPECT_TRUE(prelude_uri != audio_uri);
+    ASSERT_EQ(1, (int)srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8)).size());
+
+    // The sequence header discovers HEVC immediately, in the zero-duration
+    // window, before any further audio frame.
+    HELPER_ASSERT_SUCCESS(controller.update_video_codec(SrsVideoCodecIdHEVC));
+
+    SrsVideoCodecConfig vcodec;
+    vcodec.id = SrsVideoCodecIdHEVC;
+
+    SrsVideoFrame vframe;
+    HELPER_ASSERT_SUCCESS(vframe.initialize(&vcodec));
+    vframe.frame_type = SrsVideoAvcFrameTypeKeyFrame;
+    vframe.cts = 0;
+    vframe.dts = 0;
+    char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
+    HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
+
+    // The first real video frame supplies the segment boundary. The audio
+    // segment must be finalized before this frame is written, and the video
+    // must go to a new segment whose first PMT is HEVC.
+    int64_t video_dts = pts;
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts));
+
+    std::string video_uri = controller.ts_url();
+    EXPECT_TRUE(audio_uri != video_uri);
+
+    std::string audio_after = srs_ut70_read_file(dir + "/" + audio_uri);
+    ASSERT_TRUE(!audio_after.empty());
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(audio_after);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts + 180000));
+    HELPER_ASSERT_SUCCESS(controller.on_unpublish());
+
+    std::string published = srs_ut70_read_file(dir + "/" + video_uri);
+    ASSERT_TRUE(!published.empty());
+    groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    // The retained audio segment must have a positive duration that reflects
+    // its actual media, and the first video-bearing segment must start after
+    // it with HEVC.
+    advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_TRUE(advertised.size() >= 3);
+    EXPECT_EQ(prelude_uri, advertised.at(0).second);
+    EXPECT_EQ(audio_uri, advertised.at(1).second);
+    EXPECT_EQ(video_uri, advertised.at(2).second);
+    EXPECT_TRUE(advertised.at(1).first > 0);
+    EXPECT_TRUE(advertised.at(1).first < 1.0);
+    EXPECT_TRUE(advertised.at(2).first >= 1.0);
+    for (size_t i = 0; i < advertised.size(); i++) {
+        EXPECT_TRUE(advertised.at(i).first > 0);
+    }
+}
+
