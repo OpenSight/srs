@@ -797,9 +797,10 @@ VOID TEST(AppSecurity, CheckSecurity)
 }
 
 
-// Issue #70: the first HLS segment must advertise the real video codec. Only
-// the startup segment before the codec is discovered is provisional; a later
-// codec change must keep the media that was already written.
+// Issue #70: the first HLS segment must advertise the real video codec. Audio
+// written before the codec is discovered is preserved by reopening the segment
+// with the real codec and replaying it, and a later codec change keeps the
+// media that was already written.
 
 #define SRS_UT70_TS_PMT_PID 0x1001
 #define SRS_UT70_TS_VIDEO_PID 0x100
@@ -1081,7 +1082,12 @@ static void srs_ut70_configure(SrsHlsMuxer* muxer, SrsRequest* req, const std::s
     HELPER_ASSERT_SUCCESS(muxer->segment_open());
 }
 
-VOID TEST(HlsMuxerTest, ReopenStartupProvisionalSegmentForHevc)
+// The startup segment is not advertised, but it is not disposable: audio
+// written before the video codec is known is preserved by the same rule used
+// for later segments. A single aggregate has no measured duration, so
+// discovery reopens the segment with the real codec and replays the audio
+// before the first video keyframe.
+VOID TEST(HlsMuxerTest, StartupUnmeasuredAudioReplaysBeforeFirstVideo)
 {
     srs_error_t err = srs_success;
 
@@ -1095,34 +1101,132 @@ VOID TEST(HlsMuxerTest, ReopenStartupProvisionalSegmentForHevc)
     SrsRequest req;
     req.vhost = "__defaultVhost__";
     req.app = "live";
-    req.stream = "startup";
+    req.stream = "startup-replay";
 
-    std::string dir = _srs_tmp_file_prefix + "issue70-startup";
+    std::string dir = _srs_tmp_file_prefix + "issue70-startup-replay";
     srs_ut70_configure(&muxer, &req, dir);
 
     std::string uri = muxer.ts_url();
     std::string segment = dir + "/" + uri + ".tmp";
 
     // Audio writes the provisional AVC program map before the codec is known.
-    srs_ut70_flush_audio(&muxer, &cache, 0);
+    srs_ut70_flush_audio_with(&muxer, &cache, 36000, 'S', SRS_UT70_PAYLOAD_SIZE);
 
     std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(srs_ut70_read_file(segment));
     ASSERT_TRUE(!groups.empty());
     EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
 
-    // The sequence header discovers HEVC after the provisional write. The
-    // startup segment must be restarted, not published with the AVC PMT.
+    // The sequence header discovers HEVC. The startup segment is reopened in
+    // place, not discarded, and its audio is replayed with the original
+    // payload and timestamp.
     HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
     EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
     EXPECT_EQ(uri, muxer.ts_url());
-    EXPECT_TRUE(srs_ut70_pmt_stream_types(srs_ut70_read_file(segment)).empty());
 
-    srs_ut70_flush_video(&muxer, &cache, 0);
+    std::string replayed = srs_ut70_read_file(segment);
+    ASSERT_TRUE(!replayed.empty());
+    groups = srs_ut70_pmt_stream_types(replayed);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
 
-    groups = srs_ut70_pmt_stream_types(srs_ut70_read_file(segment));
+    int64_t audio_dts = -1;
+    int audio_offset = srs_ut70_first_pes_dts(replayed, SRS_UT70_TS_AUDIO_AAC_PID, &audio_dts);
+    ASSERT_GE(audio_offset, 0);
+    EXPECT_EQ(36000, audio_dts);
+    EXPECT_TRUE(srs_ut70_contains_run(replayed, 'S', 32));
+
+    // The first keyframe follows the replayed audio in the same segment.
+    srs_ut70_flush_video(&muxer, &cache, 90000);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    std::string published = srs_ut70_read_file(dir + "/" + uri);
+    ASSERT_TRUE(!published.empty());
+    groups = srs_ut70_pmt_stream_types(published);
     ASSERT_TRUE(!groups.empty());
     EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
     EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    int64_t video_dts = -1;
+    int video_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_VIDEO_PID, &video_dts);
+    ASSERT_GE(video_offset, 0);
+    audio_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_AUDIO_AAC_PID, &audio_dts);
+    ASSERT_GE(audio_offset, 0);
+    EXPECT_EQ(36000, audio_dts);
+    EXPECT_LT(audio_offset, video_offset);
+    EXPECT_EQ(90000, video_dts);
+    EXPECT_TRUE(srs_ut70_contains_run(published, 'S', 32));
+
+    std::vector<std::pair<double, std::string> > entries = srs_ut70_m3u8_entries(srs_ut70_read_file(dir + "/startup-replay.m3u8"));
+    ASSERT_EQ(1, (int)entries.size());
+    EXPECT_EQ(uri, entries.at(0).second);
+    EXPECT_GT(entries.at(0).first, 0.0);
+
+    muxer.dispose();
+}
+
+// A startup audio-only segment whose timing is already measured is finalized
+// as its own positive-duration entry; the first video-bearing segment then
+// opens with the real HEVC codec and does not replay the finalized audio.
+VOID TEST(HlsMuxerTest, StartupMeasuredAudioIsFinalizedAsPositiveEntry)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
+
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "startup-measured";
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-startup-measured";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    std::string audio_uri = muxer.ts_url();
+    srs_ut70_flush_audio_with(&muxer, &cache, 0, 'A', SRS_UT70_PAYLOAD_SIZE);
+    srs_ut70_flush_audio_with(&muxer, &cache, 27000, 'B', SRS_UT70_PAYLOAD_SIZE);
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    std::string video_uri = muxer.ts_url();
+    ASSERT_TRUE(audio_uri != video_uri);
+
+    std::string audio_published = srs_ut70_read_file(dir + "/" + audio_uri);
+    ASSERT_TRUE(!audio_published.empty());
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(audio_published);
+    ASSERT_TRUE(!groups.empty());
+    // A pure-audio prelude entry may still declare the configured/default video
+    // codec in its PMT, but it carries no video payload, so no real video is
+    // mislabelled.
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(srs_ut70_contains_run(audio_published, 'A', 32));
+    EXPECT_TRUE(srs_ut70_contains_run(audio_published, 'B', 32));
+    EXPECT_LT(srs_ut70_first_pes_dts(audio_published, SRS_UT70_TS_VIDEO_PID, NULL), 0);
+
+    srs_ut70_flush_video(&muxer, &cache, 90000);
+    srs_ut70_flush_video(&muxer, &cache, 270000);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    std::string video_published = srs_ut70_read_file(dir + "/" + video_uri);
+    ASSERT_TRUE(!video_published.empty());
+    groups = srs_ut70_pmt_stream_types(video_published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+    EXPECT_EQ(0, srs_ut70_count_pes_starts(video_published, SRS_UT70_TS_AUDIO_AAC_PID));
+
+    std::vector<std::pair<double, std::string> > entries = srs_ut70_m3u8_entries(srs_ut70_read_file(dir + "/startup-measured.m3u8"));
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_EQ(audio_uri, entries.at(0).second);
+    EXPECT_EQ(video_uri, entries.at(1).second);
+    EXPECT_GT(entries.at(0).first, 0.0);
+    EXPECT_GT(entries.at(1).first, 0.0);
 
     muxer.dispose();
 }
@@ -1196,8 +1300,8 @@ VOID TEST(HlsMuxerTest, LaterCodecChangePreservesEstablishedSegment)
     ASSERT_TRUE(!groups.empty());
     EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
 
-    // A later codec change is not the provisional startup case: it must keep
-    // the established segment and rely on the regular PMT refresh.
+    // A later codec change is not an initial discovery: it must keep the
+    // established segment and rely on the regular PMT refresh.
     HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
     EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
     EXPECT_EQ(uri, muxer.ts_url());
@@ -1251,7 +1355,7 @@ VOID TEST(HlsMuxerTest, LaterCodecChangeAfterDefaultCodecPreservesSegment)
     EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
 
     // A later HEVC frame reaches the write_video codec path. The established
-    // segment must be preserved: only startup audio is provisional.
+    // segment must be preserved.
     HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
     EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
     EXPECT_EQ(uri, muxer.ts_url());
@@ -1400,12 +1504,28 @@ VOID TEST(HlsControllerTest, WriteVideoDiscoversHevcAfterProvisionalAudio)
 
     SrsAudioFrame aframe;
     HELPER_ASSERT_SUCCESS(aframe.initialize(&acodec));
-    char abytes[128];
+    char abytes[8000];
     memset(abytes, 0x55, sizeof(abytes));
+    HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
     HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
     HELPER_ASSERT_SUCCESS(controller.write_audio(&aframe, 0));
 
-    // A real HEVC frame discovers the codec through the controller path.
+    std::string uri = controller.ts_url();
+    ASSERT_TRUE(!uri.empty());
+    std::string segment = dir + "/" + uri + ".tmp";
+
+    // The startup segment is still unadvertised and holds a provisional AVC
+    // program map with the written audio.
+    std::string before = srs_ut70_read_file(segment);
+    ASSERT_TRUE(!before.empty());
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(before);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    // A real HEVC frame discovers the codec through the controller path. The
+    // startup segment is reopened in place and its audio replayed, not
+    // discarded with the provisional program map.
     SrsVideoCodecConfig vcodec;
     vcodec.id = SrsVideoCodecIdHEVC;
 
@@ -1414,14 +1534,30 @@ VOID TEST(HlsControllerTest, WriteVideoDiscoversHevcAfterProvisionalAudio)
     vframe.frame_type = SrsVideoAvcFrameTypeKeyFrame;
     vframe.cts = 0;
     vframe.dts = 0;
-    char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
+    // A keyframe large enough to flush the segment writer, so the replayed
+    // audio is observable before the segment is published.
+    char vbytes[16384];
+    memset(vbytes, 0, sizeof(vbytes));
+    vbytes[0] = 0x02; vbytes[1] = 0x01; vbytes[2] = (char)0xe0; vbytes[3] = 0x44;
     HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, 18000));
+    EXPECT_EQ(uri, controller.ts_url());
 
-    // The provisional audio segment was rotated, so this is the segment that
-    // will be published. A second keyframe reaps it under the real codec.
-    std::string uri = controller.ts_url();
-    ASSERT_TRUE(!uri.empty());
+    std::string after_discovery = srs_ut70_read_file(segment);
+    ASSERT_TRUE(!after_discovery.empty());
+    groups = srs_ut70_pmt_stream_types(after_discovery);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    int64_t audio_dts = -1;
+    int audio_offset = srs_ut70_first_pes_dts(after_discovery, SRS_UT70_TS_AUDIO_AAC_PID, &audio_dts);
+    ASSERT_GE(audio_offset, 0);
+    EXPECT_EQ(0, audio_dts);
+    EXPECT_TRUE(srs_ut70_contains_run(after_discovery, 0x55, 32));
+
+    // A second keyframe reaps and publishes this segment under the real codec.
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, 180000));
 
     // Complete the publish so the buffered TS is closed and renamed, then
@@ -1430,10 +1566,24 @@ VOID TEST(HlsControllerTest, WriteVideoDiscoversHevcAfterProvisionalAudio)
 
     std::string segment_bytes = srs_ut70_read_file(dir + "/" + uri);
     ASSERT_TRUE(!segment_bytes.empty());
-    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(segment_bytes);
+    groups = srs_ut70_pmt_stream_types(segment_bytes);
     ASSERT_TRUE(!groups.empty());
     EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
     EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    audio_offset = srs_ut70_first_pes_dts(segment_bytes, SRS_UT70_TS_AUDIO_AAC_PID, &audio_dts);
+    int64_t video_dts = -1;
+    int video_offset = srs_ut70_first_pes_dts(segment_bytes, SRS_UT70_TS_VIDEO_PID, &video_dts);
+    ASSERT_GE(audio_offset, 0);
+    ASSERT_GE(video_offset, 0);
+    EXPECT_EQ(0, audio_dts);
+    EXPECT_LT(audio_offset, video_offset);
+    EXPECT_TRUE(srs_ut70_contains_run(segment_bytes, 0x55, 32));
+
+    std::vector<std::pair<double, std::string> > entries = srs_ut70_m3u8_entries(srs_ut70_read_file(dir + "/controller.m3u8"));
+    ASSERT_TRUE(entries.size() >= 1);
+    EXPECT_EQ(uri, entries.at(0).second);
+    EXPECT_GT(entries.at(0).first, 0.0);
 }
 
 // H.264 is the configured fallback, so the provisional AVC program map is
@@ -2089,9 +2239,10 @@ static void srs_ut70_expect_boundary_common(const SrsUt70BoundaryResult& r)
     }
 }
 
-// A zero-duration unadvertised segment is reopened with the discovered codec,
-// its audio replayed before the first video keyframe, and then advertised as
-// part of the video-bearing segment. The payload and timestamps are preserved.
+// A zero-duration unmeasured audio-only segment is reopened with the
+// discovered codec, its audio replayed before the first video keyframe, and
+// then advertised as part of the video-bearing segment. The payload and
+// timestamps are preserved.
 static void srs_ut70_expect_replay_boundary(const SrsUt70BoundaryResult& r)
 {
     srs_ut70_expect_boundary_common(r);
@@ -2863,9 +3014,9 @@ VOID TEST(HlsMuxerTest, AdvancingAudioDoesNotAccumulateReplayCache)
 // after the replay cache was released to finalize it. Reopening then would
 // discard the media the cache no longer covers, so the segment is finalized by
 // the existing close/open path instead: all written audio stays in its own
-// media, and the first keyframe opens the next segment with the real codec.
-// The regressed input itself is invalid, so its entry keeps whatever duration
-// the fragment measured rather than a fabricated one.
+// media, the first keyframe opens the next segment with the real codec, and
+// the entry's duration is restored from the span of timestamps actually
+// written into the segment, never fabricated.
 VOID TEST(HlsMuxerTest, RegressedTimingAfterMeasuredDurationKeepsMedia)
 {
     srs_error_t err = srs_success;
@@ -2895,10 +3046,11 @@ VOID TEST(HlsMuxerTest, RegressedTimingAfterMeasuredDurationKeepsMedia)
     std::string audio_uri = muxer.ts_url();
 
     // Unmeasured, then measured positive (releasing the cache), then a
-    // regression that returns the fragment duration to zero.
+    // regression below the segment's original start that returns the fragment
+    // duration to zero.
     srs_ut70_flush_audio_with(&muxer, &cache, 36000, 'C', 1024);
     srs_ut70_flush_audio_with(&muxer, &cache, 54000, 'D', 1024);
-    srs_ut70_flush_audio_with(&muxer, &cache, 36000, 'E', 1024);
+    srs_ut70_flush_audio_with(&muxer, &cache, 9000, 'E', 1024);
 
     HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
     std::string video_uri = muxer.ts_url();
@@ -2928,15 +3080,19 @@ VOID TEST(HlsMuxerTest, RegressedTimingAfterMeasuredDurationKeepsMedia)
     EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
     EXPECT_EQ(0, srs_ut70_count_pes_starts(video_published, SRS_UT70_TS_AUDIO_AAC_PID));
 
-    // The playlist stays contiguous. The invalid, regressed segment keeps the
-    // zero duration the fragment measured; the video segment is playable.
+    // The playlist stays contiguous and the regressed segment still carries a
+    // positive, media-derived duration: the written timestamps span from the
+    // regressed start (9000/90 = 100ms) to the highest timestamp actually
+    // written (54000/90 = 600ms), so the observed span is 500ms. The video
+    // segment is playable.
     std::vector<std::pair<double, std::string> > entries = srs_ut70_m3u8_entries(srs_ut70_read_file(dir + "/replay-regressed.m3u8"));
     ASSERT_TRUE(entries.size() >= 3);
     EXPECT_EQ(prelude_uri, entries.at(0).second);
     EXPECT_EQ(audio_uri, entries.at(1).second);
     EXPECT_EQ(video_uri, entries.at(2).second);
     EXPECT_GT(entries.at(0).first, 0.0);
-    EXPECT_EQ(0.0, entries.at(1).first);
+    EXPECT_GT(entries.at(1).first, 0.0);
+    EXPECT_NEAR(0.5, entries.at(1).first, 0.001);
     EXPECT_GE(entries.at(2).first, 1.0);
 
     muxer.dispose();

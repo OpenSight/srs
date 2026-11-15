@@ -168,29 +168,22 @@ private:
     bool current_written_;
     // Whether video media has been written in this publish session. From then
     // on the segment is established: a codec change keeps the written media
-    // and uses the regular PMT refresh. Only the startup audio-only segment is
-    // provisional and may be discarded to correct its initial program map.
+    // and uses the regular PMT refresh.
     bool video_established_;
-    // Whether any segment has already been published to the playlist in this
-    // publish session. An audio-only prelude may advertise segments before the
-    // first video frame, so from then on the current segment holds established
-    // media and must never be discarded for a provisional codec correction.
-    bool segment_advertised_;
-    // Whether the current segment's duration has ever been measured positive.
+    // Whether the current segment's written audio spans a positive duration.
     // Until then the segment may hold only an aggregate whose start DTS cannot
     // measure its media, so the audio replay cache can reconstruct it. Once the
-    // timing is measured the regular close/open path finalizes the segment;
-    // retention stops, and a later timestamp regression never reopens the
-    // cache over an incomplete segment.
+    // written media measures a positive span the regular close/open path
+    // finalizes the segment; retention stops, and a later timestamp regression
+    // never reopens the cache over an incomplete segment.
     bool segment_timing_measured_;
-    // The audio written into the current unadvertised segment while its
-    // measured duration is still zero, after an advertised prelude and before
-    // the first video of the session. Each entry owns a message that was
-    // already serialized to the segment; it is kept alive so the segment can
-    // be reopened with the discovered video codec and replayed with its
-    // original payload and timestamps, including when a further codec is
-    // discovered before the first media frame. The cache is released when a
-    // later message measures a positive duration (the close/open path then
+    // The audio written into the current segment before the first video of the
+    // session while its written media still spans no duration. Each entry owns
+    // a message that was already serialized to the segment; it is kept alive so
+    // the segment can be reopened with the discovered video codec and replayed
+    // with its original payload and timestamps, including when a further codec
+    // is discovered before the first media frame. The cache is released when a
+    // later message measures a positive written span (the close/open path then
     // finalizes the segment), when video is written, when the segment is
     // finalized, and on republish or disposal.
     struct RetainedAudio {
@@ -202,6 +195,12 @@ private:
     std::vector<RetainedAudio> retained_audio_;
     // The total payload bytes of retained_audio_, to bound the replay cache.
     int64_t retained_audio_bytes_;
+    // The lowest and highest sanitized millisecond timestamps of media that was
+    // successfully written into the current segment, or -1 before any write.
+    // They describe the span actually present in the segment, so a timestamp
+    // regression can restore its duration without fabricating one.
+    int64_t written_low_water_ms_;
+    int64_t written_high_water_ms_;
 public:
     SrsHlsMuxer();
     virtual ~SrsHlsMuxer();
@@ -215,6 +214,9 @@ private:
     // cache keeps ownership so another discovery can replay it after a new
     // reopen; it is released when the segment is established or finalized.
     srs_error_t replay_retained_audio();
+    // Record the sanitized timestamp of media successfully written into the
+    // current segment, tracking its written span.
+    void record_written_timestamp(int64_t dts);
 public:
     virtual int sequence_no();
     virtual std::string ts_url();
@@ -226,17 +228,17 @@ public:
     SrsVideoCodecId latest_vcodec();
     void set_latest_vcodec(SrsVideoCodecId v);
     // Update the video codec discovered from the stream before the initial
-    // PMT is emitted. An unwritten segment adopts it directly. A provisional
-    // startup segment that already wrote a different program map is rotated so
-    // no advertised segment mixes provisional and real codecs. If an earlier
-    // audio-only segment has been advertised, the current segment is kept with
-    // the real codec: while its measured duration is still zero it is reopened
-    // and its retained audio replayed before the first video keyframe, even if
-    // a further codec is discovered before that keyframe; a segment with
-    // measured positive duration is finalized as its own media. The retained
-    // media is never discarded and no zero-duration entry is advertised for an
-    // unmeasured segment. Once video media has been written the segment is
-    // established and kept.
+    // PMT is emitted. An unwritten segment adopts it directly. Otherwise the
+    // current segment holds audio written before the codec was known and must
+    // be kept, using the same rule for the initial segment and for any later
+    // one: while its written media spans no duration it is reopened with the
+    // real codec and its retained audio replayed before the first video
+    // keyframe, even if a further codec is discovered before that keyframe; a
+    // segment with a measured span is finalized as its own media, restoring the
+    // duration from the timestamps actually written if they regressed. The
+    // retained media is never discarded and no zero-duration entry is
+    // advertised. Once video media has been written the segment is established
+    // and kept.
     virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
 public:
     // Initialize the hls muxer.
@@ -279,8 +281,10 @@ private:
     // still dropped.
     virtual srs_error_t segment_close(bool keep_short);
     virtual srs_error_t do_segment_close(bool keep_short);
-    // Discard the current provisional segment and reopen it with the given
-    // video codec, reusing its sequence number so the playlist has no gap.
+    // Reopen the current audio-only segment with the given video codec,
+    // discarding its provisional program map and temporary file. The caller
+    // replays any retained audio; the sequence number is reused so the playlist
+    // has no gap.
     virtual srs_error_t reopen_segment(SrsVideoCodecId vcodec);
     virtual srs_error_t write_hls_key();
     virtual srs_error_t refresh_m3u8();
@@ -330,8 +334,8 @@ public:
     // @see: 3.4.11.  EXT-X-DISCONTINUITY
     virtual srs_error_t on_sequence_header();
     // Apply the video codec learned from a sequence header before any media
-    // frame writes the initial PMT of the startup segment. An audio-only
-    // segment that is still being finalized is measured by its audio media end.
+    // frame writes the segment's initial PMT, preserving audio already written
+    // before the discovery as described by SrsHlsMuxer::update_video_codec.
     virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
     // write audio to cache, if need to flush, flush to muxer.
     virtual srs_error_t write_audio(SrsAudioFrame* frame, int64_t pts);

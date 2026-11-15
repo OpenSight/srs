@@ -40,7 +40,8 @@ using namespace std;
 // TODO: FIXME: Refine to time unit.
 #define SRS_HLS_SEGMENT_MIN_DURATION (100 * SRS_UTIME_MILLISECONDS)
 
-// The bounded replay cache for the audio of the current unadvertised segment.
+// The bounded replay cache for the audio of the current segment written before
+// the first video while its media still spans no duration.
 // A normal segment holds one audio window before it is reaped, so this budget
 // covers that window even at high audio bitrates. A source that keeps sending
 // audio without advancing its timing cannot be replayed as a valid segment;
@@ -214,9 +215,10 @@ SrsHlsMuxer::SrsHlsMuxer()
     latest_vcodec_ = SrsVideoCodecIdForbidden;
     current_written_ = false;
     video_established_ = false;
-    segment_advertised_ = false;
     segment_timing_measured_ = false;
     retained_audio_bytes_ = 0;
+    written_low_water_ms_ = -1;
+    written_high_water_ms_ = -1;
 
     memset(key, 0, 16);
     memset(iv, 0, 16);
@@ -340,75 +342,66 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
         return err;
     }
 
-    // An audio-only prelude has already advertised segments, so the current
-    // segment holds only unadvertised audio. That segment cannot start with
-    // the newly discovered codec, but its media must be kept.
-    if (segment_advertised_) {
-        // The overflow reap may have flushed an audio aggregate into this
-        // segment, recording only its start DTS, so the measured duration is
-        // still zero. Reopen the unadvertised segment with the real codec,
-        // replay the audio already written into it with its original payload
-        // and timestamps, and let the first video keyframe follow. This keeps
-        // the media without advertising a zero-duration entry and without
-        // borrowing the first video timestamp.
-        //
-        // The cache stays owned until the first video establishes the segment
-        // or the segment is finalized, so a further codec discovery before the
-        // first media frame can reopen and replay it again; the reopened
-        // segment discards the previous temporary file, so nothing is
-        // duplicated.
-        if (current->duration() == 0 && !segment_timing_measured_ && !retained_audio_.empty()) {
-            srs_trace("hls: reopen zero-duration segment for video codec %d(%s), audio=%dmsgs",
-                vcodec, srs_video_codec_id2str(vcodec).c_str(), (int)retained_audio_.size());
+    // The current segment has no video media yet, so it holds audio written
+    // before the video codec was known. It cannot start with the newly
+    // discovered codec, but its media must be kept; the same rule applies to
+    // the initial segment and to any later one.
+    //
+    // While its written media spans no duration, the segment may hold only an
+    // aggregate that records its start DTS (for example the overflow reap's
+    // triggering packet). Reopen the segment with the real codec and replay the
+    // audio already written into it with its original payload and timestamps,
+    // so the first video keyframe follows it without advertising a
+    // zero-duration entry and without borrowing the first video timestamp.
+    //
+    // The cache stays owned until the first video establishes the segment or
+    // the segment is finalized, so a further codec discovery before the first
+    // media frame can reopen and replay it again; the reopened segment discards
+    // the previous temporary file, so nothing is duplicated.
+    if (current->duration() == 0 && !segment_timing_measured_ && !retained_audio_.empty()) {
+        srs_trace("hls: reopen zero-duration segment for video codec %d(%s), audio=%dmsgs",
+            vcodec, srs_video_codec_id2str(vcodec).c_str(), (int)retained_audio_.size());
 
-            if ((err = reopen_segment(vcodec)) != srs_success) {
-                return srs_error_wrap(err, "hls: reopen zero-duration segment");
-            }
-
-            if ((err = replay_retained_audio()) != srs_success) {
-                return srs_error_wrap(err, "hls: replay retained audio");
-            }
-
-            return err;
+        if ((err = reopen_segment(vcodec)) != srs_success) {
+            return srs_error_wrap(err, "hls: reopen zero-duration segment");
         }
 
-        // Either the segment's timing is already measured, or it was measured
-        // and a later timestamp regression returned the fragment duration to
-        // zero after the replay cache had been released. Reopening now would
-        // discard the written audio, and the replay cache no longer covers the
-        // whole segment, so never use it here. Finalize the segment as its own
-        // audio-only entry through the existing close/open path and start the
-        // video codec in the next segment. A regressed timestamp is invalid
-        // input: its media is preserved, and the entry carries whatever
-        // duration the fragment measured, without fabricating one.
-        srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
-            vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current->duration()));
-
-        if ((err = segment_close(true)) != srs_success) {
-            return srs_error_wrap(err, "hls: close audio-only segment");
-        }
-
-        latest_vcodec_ = vcodec;
-
-        if ((err = segment_open()) != srs_success) {
-            return srs_error_wrap(err, "hls: open segment for video codec");
+        if ((err = replay_retained_audio()) != srs_success) {
+            return srs_error_wrap(err, "hls: replay retained audio");
         }
 
         return err;
     }
 
-    // Audio may have already flushed a provisional PMT with the default codec.
-    // Restart the startup segment so the advertised one contains the real
-    // codec from its first packet. This segment was never advertised and its
-    // audio is deliberately discarded by the reopen.
-    srs_trace("hls: reopen provisional segment for video codec %d(%s)",
-        vcodec, srs_video_codec_id2str(vcodec).c_str());
-
-    if ((err = reopen_segment(vcodec)) != srs_success) {
-        return srs_error_wrap(err, "hls: reopen provisional segment");
+    // The segment has a measured written span, or its timing regressed after
+    // the replay cache was released. Reopening now would discard written audio,
+    // and the cache no longer covers the whole segment, so never use it here.
+    // Finalize the segment as its own audio-only entry through the existing
+    // close/open path and start the video codec in the next segment.
+    //
+    // A regression can leave the fragment duration at zero even though media
+    // was written beyond its final start. Restore the duration from the highest
+    // sanitized millisecond timestamp actually written into this segment: the
+    // fragment start is the minimum appended timestamp, which never exceeds that
+    // written timestamp, so appending it recovers the observed written span. No
+    // future or cached packet, video timestamp or assumed sample duration
+    // contributes.
+    if (current->duration() == 0 && written_high_water_ms_ > written_low_water_ms_) {
+        current->append(written_high_water_ms_);
     }
 
-    clear_retained_audio();
+    srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
+        vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current->duration()));
+
+    if ((err = segment_close(true)) != srs_success) {
+        return srs_error_wrap(err, "hls: close audio-only segment");
+    }
+
+    latest_vcodec_ = vcodec;
+
+    if ((err = segment_open()) != srs_success) {
+        return srs_error_wrap(err, "hls: open segment for video codec");
+    }
 
     return err;
 }
@@ -425,8 +418,8 @@ srs_error_t SrsHlsMuxer::reopen_segment(SrsVideoCodecId vcodec)
         srs_freep(err);
     }
 
-    // The provisional segment was never advertised. Reuse its sequence number
-    // so the published sequence has no gap.
+    // The reopened segment was not published. Reuse its sequence number so the
+    // published sequence has no gap.
     srs_freep(current);
     _sequence_no--;
 
@@ -449,8 +442,9 @@ srs_error_t SrsHlsMuxer::on_publish(SrsRequest* req)
     srs_error_t err = srs_success;
 
     video_established_ = false;
-    segment_advertised_ = false;
     segment_timing_measured_ = false;
+    written_low_water_ms_ = -1;
+    written_high_water_ms_ = -1;
 
     // A new publication never inherits the retained media of a previous one.
     clear_retained_audio();
@@ -663,6 +657,8 @@ srs_error_t SrsHlsMuxer::segment_open()
     context->reset();
     current_written_ = false;
     segment_timing_measured_ = false;
+    written_low_water_ms_ = -1;
+    written_high_water_ms_ = -1;
 
     return err;
 }
@@ -738,22 +734,21 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache* cache)
     // update the duration of segment.
     update_duration(cache->audio->dts);
 
-    // Audio written after an advertised prelude and before the first video of
-    // the session belongs to an unadvertised segment. Retain it so the segment
-    // can be reopened with the discovered video codec and replayed with its
-    // original payload and timestamps.
+    // Audio written before the video codec is known, while the segment's
+    // written media still spans no duration, is retained so the segment can be
+    // reopened with the discovered codec and replayed with its original
+    // payload and timestamps.
     //
-    // Only a segment whose timing is still unmeasured needs that replay: the
-    // overflow reap may have written an aggregate that records only its start
-    // DTS. Once a later message gives the segment a positive measured
-    // duration, the existing close/open path can finalize it as its own
-    // audio-only entry, so retention stops and the cache is released. This
-    // keeps normal advancing audio out of the replay budget. Bound the
-    // retained payload while the timing cannot be measured: a source that
-    // keeps writing audio without advancing its clock is invalid input and
-    // fails explicitly, instead of growing memory without bound or discarding
-    // the retained media silently.
-    bool retain = segment_advertised_ && !video_established_ && !segment_timing_measured_;
+    // Only a segment whose written media has not measured a span needs that
+    // replay: the overflow reap may have written an aggregate that records only
+    // its start DTS. Once the written media spans a positive duration, the
+    // existing close/open path can finalize the segment as its own audio-only
+    // entry, so retention stops and the cache is released. This keeps normal
+    // advancing audio out of the replay budget. Bound the retained payload
+    // while no written span exists: a source that keeps writing audio without
+    // advancing its clock is invalid input and fails explicitly, instead of
+    // growing memory without bound or discarding the retained media silently.
+    bool retain = !video_established_ && !segment_timing_measured_;
     if (!retain) {
         clear_retained_audio();
     }
@@ -767,6 +762,9 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache* cache)
         return srs_error_wrap(err, "hls: write audio");
     }
     current_written_ = true;
+
+    // Record the written span only after the media reached the segment.
+    record_written_timestamp(cache->audio->dts);
 
     // The message was serialized successfully. Transfer its ownership to the
     // replay cache instead of freeing it, so the exact payload and timestamps
@@ -810,6 +808,7 @@ srs_error_t SrsHlsMuxer::flush_video(SrsTsMessageCache* cache)
         return srs_error_wrap(err, "hls: write video");
     }
     current_written_ = true;
+    record_written_timestamp(cache->video->dts);
     video_established_ = true;
 
     // The segment is now established with the real codec and written video;
@@ -825,12 +824,29 @@ srs_error_t SrsHlsMuxer::flush_video(SrsTsMessageCache* cache)
 void SrsHlsMuxer::update_duration(uint64_t dts)
 {
     current->append(dts / 90);
+}
 
-    // Remember that this segment has a measured positive duration. From then
-    // on the existing close/open path finalizes it; the audio replay cache is
-    // not needed and stops covering the segment even if a later timestamp
-    // regression returns the fragment duration to zero.
-    if (current->duration() > 0) {
+void SrsHlsMuxer::record_written_timestamp(int64_t dts)
+{
+    // Mirror SrsFragment::append's timestamp sanitization: it receives dts/90
+    // and resets a negative or overflowing value to zero. Using the same
+    // arithmetic keeps the recorded span in the segment's own timebase.
+    static const int64_t maxMS = 0x20c49ba5e353f7LL;
+    int64_t ms = (int64_t)((uint64_t)dts / 90);
+    if (ms > maxMS || ms < 0) {
+        ms = 0;
+    }
+
+    if (written_low_water_ms_ < 0 || ms < written_low_water_ms_) {
+        written_low_water_ms_ = ms;
+    }
+    if (ms > written_high_water_ms_) {
+        written_high_water_ms_ = ms;
+    }
+
+    // The segment can be finalized by the regular close/open path only once its
+    // written media spans a positive duration; otherwise it needs the replay.
+    if (written_high_water_ms_ > written_low_water_ms_) {
         segment_timing_measured_ = true;
     }
 }
@@ -864,6 +880,7 @@ srs_error_t SrsHlsMuxer::replay_retained_audio()
             return srs_error_wrap(err, "hls: replay retained audio");
         }
 
+        record_written_timestamp(audio.msg->dts);
         update_duration(audio.msg->dts);
     }
 
@@ -941,7 +958,6 @@ srs_error_t SrsHlsMuxer::do_segment_close(bool keep_short)
         srs_freep(current->tscw);
 
         segments->append(current);
-        segment_advertised_ = true;
         current = NULL;
     } else {
         // reuse current segment index.
