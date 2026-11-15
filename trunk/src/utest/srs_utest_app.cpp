@@ -801,6 +801,7 @@ VOID TEST(AppSecurity, CheckSecurity)
 #define SRS_UT70_TS_PMT_PID 0x1001
 #define SRS_UT70_STREAM_TYPE_H264 0x1B
 #define SRS_UT70_STREAM_TYPE_HEVC 0x24
+#define SRS_UT70_STREAM_TYPE_AAC 0x0F
 #define SRS_UT70_PAYLOAD_SIZE 16384
 
 // Restore the global config even when a fatal ASSERT_* exits the test body.
@@ -1265,5 +1266,148 @@ VOID TEST(HlsControllerTest, WriteVideoDiscoversHevcAfterProvisionalAudio)
     ASSERT_TRUE(!groups.empty());
     EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
     EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+}
+
+// H.264 is the configured fallback, so the provisional AVC program map is
+// already correct when audio is written before the video codec is known. The
+// discovered codec must be adopted without rotating the segment and losing
+// that audio.
+VOID TEST(HlsControllerTest, WriteVideoDiscoversH264AfterProvisionalAudio)
+{
+    srs_error_t err = srs_success;
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-controller-h264";
+    std::stringstream conf_ss;
+    conf_ss << "listen 1935;"
+            << "vhost __defaultVhost__ {"
+            << "    hls {"
+            << "        enabled on;"
+            << "        hls_path " << dir << ";"
+            << "        hls_fragment 1;"
+            << "        hls_window 60;"
+            << "        hls_ts_file [stream]-[seq].ts;"
+            << "        hls_m3u8_file [stream].m3u8;"
+            << "    }"
+            << "}";
+    std::string conf_str = conf_ss.str();
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(conf_str.c_str()));
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsHlsController controller;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "controller-h264";
+
+    HELPER_ASSERT_SUCCESS(controller.on_publish(&req));
+
+    // Enough audio to pass the stdio buffer, so the provisional bytes are
+    // observable before any video frame arrives.
+    SrsAudioCodecConfig acodec;
+    acodec.id = SrsAudioCodecIdAAC;
+    acodec.aac_object = SrsAacObjectTypeAacLC;
+    acodec.aac_sample_rate = 3;
+    acodec.aac_channels = 2;
+
+    SrsAudioFrame aframe;
+    HELPER_ASSERT_SUCCESS(aframe.initialize(&acodec));
+    char abytes[8000];
+    memset(abytes, 0x55, sizeof(abytes));
+    HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
+    HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
+    HELPER_ASSERT_SUCCESS(controller.write_audio(&aframe, 0));
+
+    std::string uri = controller.ts_url();
+    ASSERT_TRUE(!uri.empty());
+    std::string segment = dir + "/" + uri + ".tmp";
+    std::string before = srs_ut70_read_file(segment);
+    ASSERT_TRUE(!before.empty());
+
+    // The sequence-header path calls update_video_codec directly. The matching
+    // configured fallback must be recorded without rotating the segment.
+    HELPER_ASSERT_SUCCESS(controller.update_video_codec(SrsVideoCodecIdAVC));
+    EXPECT_EQ(uri, controller.ts_url());
+    std::string after_header = srs_ut70_read_file(segment);
+    EXPECT_TRUE(after_header.length() >= before.length() && !memcmp(after_header.data(), before.data(), before.length()));
+
+    // An IDR NAL unit carries the first real H.264 frame.
+    SrsVideoCodecConfig vcodec;
+    vcodec.id = SrsVideoCodecIdAVC;
+
+    SrsVideoFrame vframe;
+    HELPER_ASSERT_SUCCESS(vframe.initialize(&vcodec));
+    vframe.frame_type = SrsVideoAvcFrameTypeKeyFrame;
+    vframe.cts = 0;
+    vframe.dts = 0;
+    char vbytes[4] = {0x65, (char)0x88, (char)0x84, 0x00};
+    HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, 18000));
+
+    // No correction was needed: the segment and its audio bytes stay put.
+    EXPECT_EQ(uri, controller.ts_url());
+    std::string after = srs_ut70_read_file(segment);
+    EXPECT_TRUE(after.length() >= before.length() && !memcmp(after.data(), before.data(), before.length()));
+
+    // A second keyframe reaps and publishes the startup segment. The published
+    // segment must still begin with the audio that was written first.
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, 180000));
+    HELPER_ASSERT_SUCCESS(controller.on_unpublish());
+
+    std::string published = srs_ut70_read_file(dir + "/" + uri);
+    ASSERT_TRUE(!published.empty());
+    EXPECT_TRUE(published.length() >= before.length() && !memcmp(published.data(), before.data(), before.length()));
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+}
+
+// With an HEVC configured fallback the provisional program map is already
+// correct for HEVC, so discovery must keep the written media as well.
+VOID TEST(HlsMuxerTest, AudioFirstConfiguredHevcDoesNotReopen)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse("listen 1935; vhost __defaultVhost__ { hls { enabled on; hls_vcodec h265; } }"));
+
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "configured-hevc";
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-configured-hevc";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    std::string uri = muxer.ts_url();
+    std::string segment = dir + "/" + uri + ".tmp";
+
+    srs_ut70_flush_audio(&muxer, &cache, 0);
+    std::string before = srs_ut70_read_file(segment);
+    ASSERT_TRUE(!before.empty());
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
+    EXPECT_EQ(uri, muxer.ts_url());
+
+    std::string after = srs_ut70_read_file(segment);
+    EXPECT_TRUE(after.length() >= before.length() && !memcmp(after.data(), before.data(), before.length()));
+
+    srs_ut70_flush_video(&muxer, &cache, 90000);
+    std::string written = srs_ut70_read_file(segment);
+    EXPECT_TRUE(written.length() >= before.length() && !memcmp(written.data(), before.data(), before.length()));
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(written);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    muxer.dispose();
 }
 
