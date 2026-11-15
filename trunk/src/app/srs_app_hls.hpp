@@ -193,8 +193,11 @@ public:
     // Update the video codec discovered from the stream before the initial
     // PMT is emitted. An unwritten segment adopts it directly. A provisional
     // startup segment that already wrote a different program map is rotated so
-    // no advertised segment mixes provisional and real codecs; once video
-    // media has been written the segment is established and kept.
+    // no advertised segment mixes provisional and real codecs. If an earlier
+    // audio-only segment has been advertised, the current audio-only segment is
+    // finalized as its own media and a new segment is opened with the real
+    // codec; once video media has been written the segment is established and
+    // kept.
     virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
 public:
     // Initialize the hls muxer.
@@ -231,7 +234,12 @@ public:
     // Close segment(ts).
     virtual srs_error_t segment_close();
 private:
-    virtual srs_error_t do_segment_close();
+    // Close segment(ts). When keep_short is set, an audio-only segment shorter
+    // than the normal minimum duration is still advertised so its already
+    // written media is retained; an oversized (corrupt timestamp) segment is
+    // still dropped.
+    virtual srs_error_t segment_close(bool keep_short);
+    virtual srs_error_t do_segment_close(bool keep_short);
     // Discard the current provisional segment and reopen it with the given
     // video codec, reusing its sequence number so the playlist has no gap.
     virtual srs_error_t reopen_segment(SrsVideoCodecId vcodec);

@@ -8,6 +8,7 @@
 using namespace std;
 
 #include <srs_kernel_error.hpp>
+#include <srs_kernel_utility.hpp>
 #include <srs_app_fragment.hpp>
 #include <srs_app_security.hpp>
 #include <srs_app_config.hpp>
@@ -826,6 +827,26 @@ static std::string srs_ut70_read_file(const std::string& path)
     return ss.str();
 }
 
+// The advertised entries of a playlist, in order, with their EXTINF duration.
+static std::vector<std::pair<double, std::string> > srs_ut70_m3u8_entries(const std::string& m3u8)
+{
+    std::vector<std::pair<double, std::string> > entries;
+
+    std::stringstream ss(m3u8);
+    std::string line;
+    double duration = 0;
+    while (std::getline(ss, line)) {
+        if (line.compare(0, 8, "#EXTINF:") == 0) {
+            duration = ::atof(line.substr(8).c_str());
+        } else if (!line.empty() && line.at(0) != '#') {
+            entries.push_back(std::make_pair(duration, line));
+            duration = 0;
+        }
+    }
+
+    return entries;
+}
+
 static std::vector<std::vector<int> > srs_ut70_pmt_stream_types(const std::string& data)
 {
     std::vector<std::vector<int> > groups;
@@ -1160,30 +1181,41 @@ VOID TEST(HlsMuxerTest, AudioOnlyPreludeKeepsMediaWhenHevcDiscovered)
     ASSERT_TRUE(!before.empty());
 
     // The first HEVC discovery of this publish session arrives after an
-    // audio-only prelude already published a segment. This is not the
-    // provisional startup segment: established audio must be preserved.
+    // audio-only prelude already published a segment. The current audio-only
+    // segment is finalized as its own advertised media, and a new segment is
+    // opened with HEVC before the first video packet.
     HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
     EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
-    EXPECT_EQ(uri, muxer.ts_url());
 
-    std::string unchanged = srs_ut70_read_file(segment);
-    EXPECT_EQ(before.size(), unchanged.size());
-    EXPECT_TRUE(before.length() == unchanged.length() && !memcmp(before.data(), unchanged.data(), before.length()));
+    std::string video_uri = muxer.ts_url();
+    EXPECT_TRUE(uri != video_uri);
 
-    // The advertised prelude keeps its bytes and its playlist entry.
+    std::string audio_published = srs_ut70_read_file(dir + "/" + uri);
+    ASSERT_TRUE(!audio_published.empty());
+    EXPECT_TRUE(audio_published.length() >= before.length());
+    EXPECT_TRUE(!memcmp(audio_published.data(), before.data(), before.length()));
+
+    std::vector<std::vector<int> > audio_groups = srs_ut70_pmt_stream_types(audio_published);
+    ASSERT_TRUE(!audio_groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(audio_groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(audio_groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    // The advertised prelude keeps its bytes and its playlist entry, and the
+    // finalized audio segment is advertised before the video segment.
     std::string prelude_after = srs_ut70_read_file(prelude);
     EXPECT_TRUE(prelude_bytes.length() == prelude_after.length() && !memcmp(prelude_bytes.data(), prelude_after.data(), prelude_bytes.length()));
-    EXPECT_TRUE(srs_ut70_read_file(m3u8).find("audio-prelude-0.ts") != std::string::npos);
+    std::string playlist = srs_ut70_read_file(m3u8);
+    EXPECT_TRUE(playlist.find("audio-prelude-0.ts") != std::string::npos);
+    EXPECT_TRUE(playlist.find(uri) != std::string::npos);
 
-    // Later video refreshes the PMT to HEVC without deleting prior audio.
+    // The first video packet opens a segment whose initial PMT is HEVC.
     srs_ut70_flush_video(&muxer, &cache, 90000);
 
-    std::string after = srs_ut70_read_file(segment);
+    std::string after = srs_ut70_read_file(dir + "/" + video_uri + ".tmp");
     std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(after);
-    ASSERT_TRUE(groups.size() >= 2);
-    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
-    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(groups.size() - 1), SRS_UT70_STREAM_TYPE_HEVC));
-    EXPECT_TRUE(before.length() <= after.length() && !memcmp(before.data(), after.data(), before.length()));
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
 
     muxer.dispose();
 }
@@ -1409,5 +1441,163 @@ VOID TEST(HlsMuxerTest, AudioFirstConfiguredHevcDoesNotReopen)
     EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
 
     muxer.dispose();
+}
+
+// The production reap trigger publishes audio-only prelude segments when audio
+// runs before video. When the first HEVC frame is discovered afterwards, the
+// current audio-only segment cannot start with the real codec, so it must be
+// finalized as its own segment (retaining the audio) and the first segment that
+// carries video must open with an HEVC program map.
+VOID TEST(HlsControllerTest, AudioOnlyPreludeThenVideoStartsWithHevcPmt)
+{
+    srs_error_t err = srs_success;
+
+    // Unique per run: this test reads the playlist to detect the reap, so a
+    // stale playlist from an earlier run must not be observed.
+    std::stringstream dir_ss;
+    dir_ss << _srs_tmp_file_prefix << "issue70-prelude-controller-" << srs_update_system_time();
+    std::string dir = dir_ss.str();
+    std::stringstream conf_ss;
+    conf_ss << "listen 1935;"
+            << "vhost __defaultVhost__ {"
+            << "    hls {"
+            << "        enabled on;"
+            << "        hls_path " << dir << ";"
+            << "        hls_fragment 1;"
+            << "        hls_window 60;"
+            << "        hls_ts_file [stream]-[seq].ts;"
+            << "        hls_m3u8_file [stream].m3u8;"
+            << "    }"
+            << "}";
+    std::string conf_str = conf_ss.str();
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(conf_str.c_str()));
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsHlsController controller;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "prelude-controller";
+
+    HELPER_ASSERT_SUCCESS(controller.on_publish(&req));
+
+    SrsAudioCodecConfig acodec;
+    acodec.id = SrsAudioCodecIdAAC;
+    acodec.aac_object = SrsAacObjectTypeAacLC;
+    acodec.aac_sample_rate = 3;
+    acodec.aac_channels = 2;
+
+    SrsAudioFrame aframe;
+    HELPER_ASSERT_SUCCESS(aframe.initialize(&acodec));
+    char abytes[1024];
+    memset(abytes, 0x55, sizeof(abytes));
+    HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
+
+    std::string m3u8 = dir + "/prelude-controller.m3u8";
+
+    // Drive audio through the controller until the natural absolute overflow
+    // (hls_aof_ratio * hls_fragment) reaps and advertises an audio-only segment.
+    int64_t pts = 0;
+    int writes = 0;
+    for (; writes < 600; writes++) {
+        HELPER_ASSERT_SUCCESS(controller.write_audio(&aframe, pts));
+        pts += 1920; // 21.3ms in the 90kHz TS timescale
+        if (srs_ut70_read_file(m3u8).find("#EXTINF") != std::string::npos) {
+            break;
+        }
+    }
+    ASSERT_TRUE(writes < 600);
+
+    std::vector<std::pair<double, std::string> > advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_EQ(1, (int)advertised.size());
+    std::string prelude_uri = advertised.at(0).second;
+    std::string prelude = srs_ut70_read_file(dir + "/" + prelude_uri);
+    ASSERT_TRUE(!prelude.empty());
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(prelude);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    // More audio lands in the next, not yet advertised segment. Keep it below
+    // the 100ms minimum duration so the correction must retain it deliberately
+    // instead of relying on the normal segment validity window.
+    for (int i = 0; i < 3; i++) {
+        HELPER_ASSERT_SUCCESS(controller.write_audio(&aframe, pts));
+        pts += 1920;
+    }
+
+    std::string audio_uri = controller.ts_url();
+    EXPECT_TRUE(prelude_uri != audio_uri);
+    std::string audio_tmp = dir + "/" + audio_uri + ".tmp";
+    std::string audio_before = srs_ut70_read_file(audio_tmp);
+    ASSERT_TRUE(!audio_before.empty());
+    EXPECT_EQ(1, (int)srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8)).size());
+
+    // The video sequence header discovers HEVC. The audio segment is finalized
+    // as its own advertised media and a new segment is opened for video.
+    HELPER_ASSERT_SUCCESS(controller.update_video_codec(SrsVideoCodecIdHEVC));
+
+    std::string video_uri = controller.ts_url();
+    EXPECT_TRUE(audio_uri != video_uri);
+
+    std::string audio_after = srs_ut70_read_file(dir + "/" + audio_uri);
+    ASSERT_TRUE(!audio_after.empty());
+    EXPECT_TRUE(audio_after.length() >= audio_before.length());
+    EXPECT_TRUE(!memcmp(audio_after.data(), audio_before.data(), audio_before.length()));
+
+    advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_EQ(2, (int)advertised.size());
+    EXPECT_EQ(audio_uri, advertised.at(1).second);
+
+    groups = srs_ut70_pmt_stream_types(audio_after);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    // The first real HEVC frame is written into the new segment. Its first PMT
+    // must already be HEVC: no AVC-program-map segment may carry video.
+    SrsVideoCodecConfig vcodec;
+    vcodec.id = SrsVideoCodecIdHEVC;
+
+    SrsVideoFrame vframe;
+    HELPER_ASSERT_SUCCESS(vframe.initialize(&vcodec));
+    vframe.frame_type = SrsVideoAvcFrameTypeKeyFrame;
+    vframe.cts = 0;
+    vframe.dts = 0;
+    char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
+    HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
+
+    int64_t video_dts = pts;
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts));
+
+    EXPECT_EQ(video_uri, controller.ts_url());
+
+    // A later keyframe overflows this segment under the normal wait-keyframe
+    // rule and publishes exactly the segment that carries the first video.
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts + 180000));
+    HELPER_ASSERT_SUCCESS(controller.on_unpublish());
+
+    std::string published = srs_ut70_read_file(dir + "/" + video_uri);
+    ASSERT_TRUE(!published.empty());
+    groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    // Playlist order is contiguous and the video segment has a playable
+    // duration; the audio prelude media is still advertised before it.
+    advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_TRUE(advertised.size() >= 3);
+    EXPECT_EQ(prelude_uri, advertised.at(0).second);
+    EXPECT_EQ(audio_uri, advertised.at(1).second);
+    EXPECT_EQ(video_uri, advertised.at(2).second);
+    EXPECT_TRUE(advertised.at(1).first > 0);
+    EXPECT_TRUE(advertised.at(2).first >= 1.0);
+    for (size_t i = 0; i < advertised.size(); i++) {
+        EXPECT_TRUE(advertised.at(i).first > 0);
+    }
 }
 

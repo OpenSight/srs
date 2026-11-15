@@ -321,10 +321,31 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
 
     // Once real video media has been written, the segment is established. A
     // later codec change keeps that media and uses the regular PMT refresh.
-    // The same applies after an audio-only prelude has published a segment:
-    // that media is already established even before the first video frame.
-    if (video_established_ || segment_advertised_) {
+    if (video_established_) {
         set_latest_vcodec(vcodec);
+        return err;
+    }
+
+    // An audio-only prelude has already advertised segments, so the current
+    // segment holds only unadvertised audio. That segment cannot start with
+    // the newly discovered codec, but its media must be kept: finalize it as
+    // audio-only media, then open the next segment with the real codec before
+    // the first video packet, so no advertised video segment starts with the
+    // provisional program map.
+    if (segment_advertised_) {
+        srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
+            vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current->duration()));
+
+        if ((err = segment_close(true)) != srs_success) {
+            return srs_error_wrap(err, "hls: close audio-only segment");
+        }
+
+        latest_vcodec_ = vcodec;
+
+        if ((err = segment_open()) != srs_success) {
+            return srs_error_wrap(err, "hls: open segment for video codec");
+        }
+
         return err;
     }
 
@@ -710,7 +731,12 @@ void SrsHlsMuxer::update_duration(uint64_t dts)
 
 srs_error_t SrsHlsMuxer::segment_close()
 {
-    srs_error_t err = do_segment_close();
+    return segment_close(false);
+}
+
+srs_error_t SrsHlsMuxer::segment_close(bool keep_short)
+{
+    srs_error_t err = do_segment_close(keep_short);
 
     // We always cleanup current segment.
     srs_freep(current);
@@ -718,7 +744,7 @@ srs_error_t SrsHlsMuxer::segment_close()
     return err;
 }
 
-srs_error_t SrsHlsMuxer::do_segment_close()
+srs_error_t SrsHlsMuxer::do_segment_close(bool keep_short)
 {
     srs_error_t err = srs_success;
     
@@ -739,7 +765,7 @@ srs_error_t SrsHlsMuxer::do_segment_close()
     // when too small, it maybe not enough data to play.
     // when too large, it maybe timestamp corrupt.
     // make the segment more acceptable, when in [min, max_td * 3], it's ok.
-    bool matchMinDuration = current->duration() >= SRS_HLS_SEGMENT_MIN_DURATION;
+    bool matchMinDuration = keep_short || current->duration() >= SRS_HLS_SEGMENT_MIN_DURATION;
     bool matchMaxDuration = current->duration() <= max_td * 3 * 1000;
     if (matchMinDuration && matchMaxDuration) {
         // rename from tmp to real path
