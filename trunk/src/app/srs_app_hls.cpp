@@ -204,7 +204,9 @@ SrsHlsMuxer::SrsHlsMuxer()
     segments = new SrsFragmentWindow();
     latest_acodec_ = SrsAudioCodecIdForbidden;
     latest_vcodec_ = SrsVideoCodecIdForbidden;
-    
+    current_written_ = false;
+    video_established_ = false;
+
     memset(key, 0, 16);
     memset(iv, 0, 16);
 }
@@ -301,6 +303,68 @@ void SrsHlsMuxer::set_latest_vcodec(SrsVideoCodecId v)
     latest_vcodec_ = v;
 }
 
+srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
+{
+    srs_error_t err = srs_success;
+
+    if (latest_vcodec() == vcodec) {
+        return err;
+    }
+
+    // No TS packet has been written yet, so the current segment will emit its
+    // initial PMT with the codec we just learned from the stream.
+    if (!current || !current_written_) {
+        set_latest_vcodec(vcodec);
+        return err;
+    }
+
+    // Once real video media has been written, the segment is established. A
+    // later codec change keeps that media and uses the regular PMT refresh.
+    // Only the startup segment before the first video frame is provisional.
+    if (video_established_) {
+        set_latest_vcodec(vcodec);
+        return err;
+    }
+
+    // Audio may have already flushed a provisional PMT with the default codec.
+    // Restart the startup segment so the advertised one contains the real
+    // codec from its first packet.
+    srs_trace("hls: reopen provisional segment for video codec %d(%s)",
+        vcodec, srs_video_codec_id2str(vcodec).c_str());
+
+    if ((err = reopen_segment(vcodec)) != srs_success) {
+        return srs_error_wrap(err, "hls: reopen provisional segment");
+    }
+
+    return err;
+}
+
+srs_error_t SrsHlsMuxer::reopen_segment(SrsVideoCodecId vcodec)
+{
+    srs_error_t err = srs_success;
+
+    srs_assert(current);
+
+    current->writer->close();
+    if ((err = current->unlink_tmpfile()) != srs_success) {
+        srs_warn("Unlink tmp ts failed %s", srs_error_desc(err).c_str());
+        srs_freep(err);
+    }
+
+    // The provisional segment was never advertised. Reuse its sequence number
+    // so the published sequence has no gap.
+    srs_freep(current);
+    _sequence_no--;
+
+    latest_vcodec_ = vcodec;
+
+    if ((err = segment_open()) != srs_success) {
+        return srs_error_wrap(err, "hls: open segment for video codec");
+    }
+
+    return err;
+}
+
 srs_error_t SrsHlsMuxer::initialize()
 {
     return srs_success;
@@ -309,6 +373,8 @@ srs_error_t SrsHlsMuxer::initialize()
 srs_error_t SrsHlsMuxer::on_publish(SrsRequest* req)
 {
     srs_error_t err = srs_success;
+
+    video_established_ = false;
 
     if ((err = async->start()) != srs_success) {
         return srs_error_wrap(err, "async start");
@@ -516,7 +582,8 @@ srs_error_t SrsHlsMuxer::segment_open()
 
     // reset the context for a new ts start.
     context->reset();
-    
+    current_written_ = false;
+
     return err;
 }
 
@@ -594,7 +661,8 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache* cache)
     if ((err = current->tscw->write_audio(cache->audio)) != srs_success) {
         return srs_error_wrap(err, "hls: write audio");
     }
-    
+    current_written_ = true;
+
     // write success, clear and free the msg
     srs_freep(cache->audio);
     
@@ -623,7 +691,9 @@ srs_error_t SrsHlsMuxer::flush_video(SrsTsMessageCache* cache)
     if ((err = current->tscw->write_video(cache->video)) != srs_success) {
         return srs_error_wrap(err, "hls: write video");
     }
-    
+    current_written_ = true;
+    video_established_ = true;
+
     // write success, clear and free the msg
     srs_freep(cache->video);
     
@@ -1011,6 +1081,11 @@ srs_error_t SrsHlsController::on_sequence_header()
     return muxer->on_sequence_header();
 }
 
+srs_error_t SrsHlsController::update_video_codec(SrsVideoCodecId vcodec)
+{
+    return muxer->update_video_codec(vcodec);
+}
+
 srs_error_t SrsHlsController::write_audio(SrsAudioFrame* frame, int64_t pts)
 {
     srs_error_t err = srs_success;
@@ -1070,7 +1145,9 @@ srs_error_t SrsHlsController::write_video(SrsVideoFrame* frame, int64_t dts)
     if (muxer->latest_vcodec() != frame->vcodec()->id) {
         srs_trace("HLS: Switch video codec %d(%s) to %d(%s)", muxer->latest_vcodec(), srs_video_codec_id2str(muxer->latest_vcodec()).c_str(),
                   frame->vcodec()->id, srs_video_codec_id2str(frame->vcodec()->id).c_str());
-        muxer->set_latest_vcodec(frame->vcodec()->id);
+        if ((err = muxer->update_video_codec(frame->vcodec()->id)) != srs_success) {
+            return srs_error_wrap(err, "hls: update video codec");
+        }
     }
 
     // write video to cache.
@@ -1463,6 +1540,11 @@ srs_error_t SrsHls::on_video(SrsSharedPtrMessage* shared_video, SrsFormat* forma
     
     // ignore sequence header
     if (format->video->avc_packet_type == SrsVideoAvcFrameTraitSequenceHeader) {
+        // Seed the muxer with the real codec before any media frame can emit
+        // the initial PMT with the provisional default codec.
+        if ((err = controller->update_video_codec(format->vcodec->id)) != srs_success) {
+            return srs_error_wrap(err, "hls: update video codec");
+        }
         return controller->on_sequence_header();
     }
     

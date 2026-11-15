@@ -11,6 +11,15 @@ using namespace std;
 #include <srs_app_fragment.hpp>
 #include <srs_app_security.hpp>
 #include <srs_app_config.hpp>
+#include <srs_app_hls.hpp>
+#include <srs_kernel_ts.hpp>
+#include <srs_protocol_rtmp_stack.hpp>
+#include <srs_utest_config.hpp>
+
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <vector>
 
 #include <srs_app_st.hpp>
 #include <srs_protocol_conn.hpp>
@@ -781,5 +790,320 @@ VOID TEST(AppSecurity, CheckSecurity)
     //       2. default to deny all when security enabled.
     //       3. allow if matches allow strategy.
     //       4. deny if matches deny strategy.
+}
+
+
+// Issue #70: the first HLS segment must advertise the real video codec. Only
+// the startup segment before the codec is discovered is provisional; a later
+// codec change must keep the media that was already written.
+
+#define SRS_UT70_TS_PMT_PID 0x1001
+#define SRS_UT70_STREAM_TYPE_H264 0x1B
+#define SRS_UT70_STREAM_TYPE_HEVC 0x24
+#define SRS_UT70_PAYLOAD_SIZE 16384
+
+static std::string srs_ut70_read_file(const std::string& path)
+{
+    std::ifstream in(path.c_str(), std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static std::vector<std::vector<int> > srs_ut70_pmt_stream_types(const std::string& data)
+{
+    std::vector<std::vector<int> > groups;
+    std::vector<unsigned char> section;
+
+    for (size_t offset = 0; offset + SRS_TS_PACKET_SIZE <= data.size(); offset += SRS_TS_PACKET_SIZE) {
+        const unsigned char* packet = (const unsigned char*)data.data() + offset;
+        if (packet[0] != 0x47) continue;
+
+        int pid = ((packet[1] & 0x1F) << 8) | packet[2];
+        if (pid != SRS_UT70_TS_PMT_PID) continue;
+
+        bool payload_start = (packet[1] & 0x40) != 0;
+        int adaptation = (packet[3] >> 4) & 0x03;
+        int index = 4;
+        if (adaptation & 0x02) {
+            index += 1 + packet[4];
+        }
+        if (!(adaptation & 0x01) || index >= SRS_TS_PACKET_SIZE) continue;
+
+        if (payload_start) {
+            int pointer = packet[index];
+            int begin = index + 1 + pointer;
+            if (begin > SRS_TS_PACKET_SIZE) continue;
+            section.assign(packet + begin, packet + SRS_TS_PACKET_SIZE);
+        } else if (!section.empty()) {
+            section.insert(section.end(), packet + index, packet + SRS_TS_PACKET_SIZE);
+        }
+
+        if (section.size() < 12 || section[0] != 0x02) continue;
+        int section_length = ((section[1] & 0x0F) << 8) | section[2];
+        if ((int)section.size() < 3 + section_length) continue;
+
+        int program_info_length = ((section[10] & 0x0F) << 8) | section[11];
+        int position = 12 + program_info_length;
+        int end = 3 + section_length - 4;
+        std::vector<int> types;
+        while (position + 5 <= end) {
+            types.push_back(section[position]);
+            int es_info_length = ((section[position + 3] & 0x0F) << 8) | section[position + 4];
+            position += 5 + es_info_length;
+        }
+        groups.push_back(types);
+        section.clear();
+    }
+
+    return groups;
+}
+
+static bool srs_ut70_has_stream_type(const std::vector<int>& types, int stream_type)
+{
+    for (size_t i = 0; i < types.size(); i++) {
+        if (types.at(i) == stream_type) return true;
+    }
+    return false;
+}
+
+static void srs_ut70_flush_audio(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, int64_t dts)
+{
+    srs_error_t err = srs_success;
+
+    SrsTsMessage* audio = new SrsTsMessage();
+    audio->dts = audio->pts = audio->start_pts = dts;
+    audio->write_pcr = false;
+    audio->sid = SrsTsPESStreamIdAudioCommon;
+
+    std::string payload(SRS_UT70_PAYLOAD_SIZE, '\0');
+    audio->payload->append(payload.data(), (int)payload.size());
+
+    cache->audio = audio;
+    HELPER_ASSERT_SUCCESS(muxer->flush_audio(cache));
+}
+
+static void srs_ut70_flush_video(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, int64_t dts)
+{
+    srs_error_t err = srs_success;
+
+    SrsTsMessage* video = new SrsTsMessage();
+    video->dts = video->pts = video->start_pts = dts;
+    video->write_pcr = true;
+    video->sid = SrsTsPESStreamIdVideoCommon;
+
+    std::string payload(SRS_UT70_PAYLOAD_SIZE, '\0');
+    video->payload->append(payload.data(), (int)payload.size());
+
+    cache->video = video;
+    HELPER_ASSERT_SUCCESS(muxer->flush_video(cache));
+}
+
+static void srs_ut70_configure(SrsHlsMuxer* muxer, SrsRequest* req, const std::string& dir)
+{
+    srs_error_t err = srs_success;
+
+    HELPER_ASSERT_SUCCESS(muxer->update_config(req, "", dir, "[stream].m3u8", "[stream]-[seq].ts",
+        1 * SRS_UTIME_SECONDS, 60 * SRS_UTIME_SECONDS, false, 10.0, false, true, false, 0, "", "", ""));
+    HELPER_ASSERT_SUCCESS(muxer->segment_open());
+}
+
+VOID TEST(HlsMuxerTest, ReopenStartupProvisionalSegmentForHevc)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
+
+    SrsConfig* previous = _srs_config;
+    _srs_config = &conf;
+
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "startup";
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-startup";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    std::string uri = muxer.ts_url();
+    std::string segment = dir + "/" + uri + ".tmp";
+
+    // Audio writes the provisional AVC program map before the codec is known.
+    srs_ut70_flush_audio(&muxer, &cache, 0);
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(srs_ut70_read_file(segment));
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    // The sequence header discovers HEVC after the provisional write. The
+    // startup segment must be restarted, not published with the AVC PMT.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
+    EXPECT_EQ(uri, muxer.ts_url());
+    EXPECT_TRUE(srs_ut70_pmt_stream_types(srs_ut70_read_file(segment)).empty());
+
+    srs_ut70_flush_video(&muxer, &cache, 0);
+
+    groups = srs_ut70_pmt_stream_types(srs_ut70_read_file(segment));
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    muxer.dispose();
+    _srs_config = previous;
+}
+
+VOID TEST(HlsMuxerTest, AdoptDiscoveredCodecBeforeFirstPacket)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
+
+    SrsConfig* previous = _srs_config;
+    _srs_config = &conf;
+
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "adopt";
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-adopt";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    std::string uri = muxer.ts_url();
+    std::string segment = dir + "/" + uri + ".tmp";
+
+    // No TS packet was written yet, so no segment restart is needed.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
+    EXPECT_EQ(uri, muxer.ts_url());
+    EXPECT_TRUE(srs_ut70_pmt_stream_types(srs_ut70_read_file(segment)).empty());
+
+    srs_ut70_flush_video(&muxer, &cache, 0);
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(srs_ut70_read_file(segment));
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    muxer.dispose();
+    _srs_config = previous;
+}
+
+VOID TEST(HlsMuxerTest, LaterCodecChangePreservesEstablishedSegment)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
+
+    SrsConfig* previous = _srs_config;
+    _srs_config = &conf;
+
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "later";
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-later";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    std::string uri = muxer.ts_url();
+    std::string segment = dir + "/" + uri + ".tmp";
+
+    // Startup codec is AVC; then real audio and video are written.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    srs_ut70_flush_audio(&muxer, &cache, 0);
+    srs_ut70_flush_video(&muxer, &cache, 0);
+
+    std::string before = srs_ut70_read_file(segment);
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(before);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    // A later codec change is not the provisional startup case: it must keep
+    // the established segment and rely on the regular PMT refresh.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
+    EXPECT_EQ(uri, muxer.ts_url());
+
+    std::string unchanged = srs_ut70_read_file(segment);
+    EXPECT_EQ(before.size(), unchanged.size());
+    EXPECT_TRUE(before.length() == unchanged.length() && !memcmp(before.data(), unchanged.data(), before.length()));
+
+    srs_ut70_flush_video(&muxer, &cache, 9000);
+
+    std::string after = srs_ut70_read_file(segment);
+    groups = srs_ut70_pmt_stream_types(after);
+    ASSERT_TRUE(groups.size() >= 2);
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(groups.size() - 1), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(before.length() <= after.length() && !memcmp(before.data(), after.data(), before.length()));
+
+    muxer.dispose();
+    _srs_config = previous;
+}
+
+VOID TEST(HlsMuxerTest, LaterCodecChangeAfterDefaultCodecPreservesSegment)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
+
+    SrsConfig* previous = _srs_config;
+    _srs_config = &conf;
+
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "default-later";
+
+    std::string dir = _srs_tmp_file_prefix + "issue70-default-later";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    std::string uri = muxer.ts_url();
+    std::string segment = dir + "/" + uri + ".tmp";
+
+    // The stream starts with the default AVC codec and no sequence-header
+    // update reaches the muxer, so the first video frames establish the
+    // segment without arming any discovery flag.
+    srs_ut70_flush_video(&muxer, &cache, 0);
+
+    std::string before = srs_ut70_read_file(segment);
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(before);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    // A later HEVC frame reaches the write_video codec path. The established
+    // segment must be preserved: only startup audio is provisional.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.latest_vcodec());
+    EXPECT_EQ(uri, muxer.ts_url());
+
+    std::string unchanged = srs_ut70_read_file(segment);
+    EXPECT_EQ(before.size(), unchanged.size());
+    EXPECT_TRUE(before.length() == unchanged.length() && !memcmp(before.data(), unchanged.data(), before.length()));
+
+    srs_ut70_flush_video(&muxer, &cache, 9000);
+
+    std::string after = srs_ut70_read_file(segment);
+    groups = srs_ut70_pmt_stream_types(after);
+    ASSERT_TRUE(groups.size() >= 2);
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(groups.size() - 1), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(before.length() <= after.length() && !memcmp(before.data(), after.data(), before.length()));
+
+    muxer.dispose();
+    _srs_config = previous;
 }
 

@@ -161,6 +161,15 @@ private:
     SrsAudioCodecId latest_acodec_;
     // Latest audio codec, parsed from stream.
     SrsVideoCodecId latest_vcodec_;
+    // Whether the current segment has written any TS packet. Until then the
+    // segment can still adopt the video codec learned from the stream, so its
+    // initial PMT advertises the real codec.
+    bool current_written_;
+    // Whether video media has been written in this publish session. From then
+    // on the segment is established: a codec change keeps the written media
+    // and uses the regular PMT refresh. Only the startup audio-only segment is
+    // provisional and may be discarded to correct its initial program map.
+    bool video_established_;
 public:
     SrsHlsMuxer();
     virtual ~SrsHlsMuxer();
@@ -176,6 +185,12 @@ public:
     void set_latest_acodec(SrsAudioCodecId v);
     SrsVideoCodecId latest_vcodec();
     void set_latest_vcodec(SrsVideoCodecId v);
+    // Update the video codec discovered from the stream before the initial
+    // PMT is emitted. An unwritten segment adopts it directly. A provisional
+    // startup segment that already wrote a different program map is rotated so
+    // no advertised segment mixes provisional and real codecs; once video
+    // media has been written the segment is established and kept.
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
 public:
     // Initialize the hls muxer.
     virtual srs_error_t initialize();
@@ -212,6 +227,9 @@ public:
     virtual srs_error_t segment_close();
 private:
     virtual srs_error_t do_segment_close();
+    // Discard the current provisional segment and reopen it with the given
+    // video codec, reusing its sequence number so the playlist has no gap.
+    virtual srs_error_t reopen_segment(SrsVideoCodecId vcodec);
     virtual srs_error_t write_hls_key();
     virtual srs_error_t refresh_m3u8();
     virtual srs_error_t _refresh_m3u8(std::string m3u8_file);
@@ -259,6 +277,9 @@ public:
     // @see: hls-m3u8-draft-pantos-http-live-streaming-12.txt
     // @see: 3.4.11.  EXT-X-DISCONTINUITY
     virtual srs_error_t on_sequence_header();
+    // Apply the video codec learned from a sequence header before any media
+    // frame writes the initial PMT of the startup segment.
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
     // write audio to cache, if need to flush, flush to muxer.
     virtual srs_error_t write_audio(SrsAudioFrame* frame, int64_t pts);
     // write video to muxer.
