@@ -30,6 +30,7 @@ class SrsFileWriter;
 class SrsSimpleStream;
 class SrsTsAacJitter;
 class SrsTsMessageCache;
+class SrsTsMessage;
 class SrsHlsSegment;
 class SrsTsContext;
 
@@ -175,16 +176,33 @@ private:
     // first video frame, so from then on the current segment holds established
     // media and must never be discarded for a provisional codec correction.
     bool segment_advertised_;
-    // The media end DTS in 90khz of the audio aggregates successfully written
-    // into the current segment; zero when no written audio has known timing.
-    // It measures the audio-only segment that a video codec discovery must
-    // close, without borrowing the first video timestamp.
-    int64_t audio_end_dts_;
+    // The audio written into the current segment after an advertised prelude
+    // and before the first video of the session. Each entry owns a message
+    // that was already serialized to the segment; it is kept alive so the
+    // segment can be reopened with the discovered video codec and replayed
+    // with its original payload and timestamps. The list is empty while the
+    // segment is advertised or video-established.
+    struct RetainedAudio {
+        // The written message, owned by this cache until replayed or freed.
+        SrsTsMessage* msg;
+        // The audio codec used when the message was written.
+        SrsAudioCodecId acodec;
+    };
+    std::vector<RetainedAudio> retained_audio_;
+    // The total payload bytes of retained_audio_, to bound the replay cache.
+    int64_t retained_audio_bytes_;
 public:
     SrsHlsMuxer();
     virtual ~SrsHlsMuxer();
 public:
     virtual void dispose();
+private:
+    // Free the retained audio replay cache of the current segment.
+    void clear_retained_audio();
+    // Replay the retained audio into the current reopened segment, preserving
+    // its payload and timestamps and marking the segment as written again.
+    // Ownership of the replayed messages ends here.
+    srs_error_t replay_retained_audio();
 public:
     virtual int sequence_no();
     virtual std::string ts_url();
@@ -200,11 +218,12 @@ public:
     // startup segment that already wrote a different program map is rotated so
     // no advertised segment mixes provisional and real codecs. If an earlier
     // audio-only segment has been advertised, the current audio-only segment is
-    // finalized as its own media and a new segment is opened with the real
-    // codec; once video media has been written the segment is established and
-    // kept. The closed segment's duration comes from the media end of the audio
-    // actually written, never from a video timestamp; if that end is unavailable
-    // the codec update fails instead of advertising a zero-duration segment.
+    // kept with the real codec: a zero-duration segment is reopened and its
+    // retained audio replayed before the first video keyframe, while a segment
+    // with measured positive duration is finalized as its own media. The
+    // retained media is never discarded and no zero-duration entry is
+    // advertised. Once video media has been written the segment is established
+    // and kept.
     virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
 public:
     // Initialize the hls muxer.

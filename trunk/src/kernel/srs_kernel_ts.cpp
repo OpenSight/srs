@@ -74,7 +74,6 @@ SrsTsMessage::SrsTsMessage(SrsTsChannel* c, SrsTsPacket* p)
     ps_helper_ = NULL;
     
     dts = pts = 0;
-    end_dts = 0;
     sid = (SrsTsPESStreamId)0x00;
     continuity_counter = 0;
     PES_packet_length = 0;
@@ -163,7 +162,6 @@ SrsTsMessage* SrsTsMessage::detach()
     cp->is_discontinuity = is_discontinuity;
     cp->dts = dts;
     cp->pts = pts;
-    cp->end_dts = end_dts;
     cp->sid = sid;
     cp->PES_packet_length = PES_packet_length;
     cp->continuity_counter = continuity_counter;
@@ -2827,56 +2825,12 @@ SrsTsMessageCache::SrsTsMessageCache()
 {
     audio = NULL;
     video = NULL;
-    audio_last_dts_ = -1;
 }
 
 SrsTsMessageCache::~SrsTsMessageCache()
 {
     srs_freep(audio);
     srs_freep(video);
-}
-
-void SrsTsMessageCache::reset_audio_timing()
-{
-    audio_last_dts_ = -1;
-}
-
-int64_t SrsTsMessageCache::audio_packet_duration(SrsAudioFrame* frame, int64_t dts)
-{
-    SrsAudioCodecConfig* acodec = frame->acodec();
-
-    // An empty packet contributes no media duration.
-    if (frame->nb_samples <= 0) {
-        return 0;
-    }
-
-    // A raw AAC frame is one raw_data_block of 1024 samples. Use the sampling
-    // frequency from the AudioSpecificConfig, the decoder configuration, for
-    // the profiles whose frame length is known; the FLV SoundRate is only a
-    // coarse tag value. Other profiles, such as HE-AAC, are left to the
-    // validated cadence below instead of assuming 1024 samples.
-    if (acodec->id == SrsAudioCodecIdAAC) {
-        int aot = (int)acodec->aac_object;
-        int rate_index = (int)acodec->aac_sample_rate;
-
-        if ((aot == SrsAacObjectTypeAacMain || aot == SrsAacObjectTypeAacLC || aot == SrsAacObjectTypeAacSSR)
-            && rate_index >= 0 && rate_index <= 12 && srs_aac_srates[rate_index] > 0) {
-            int64_t samples = (int64_t)frame->nb_samples * 1024;
-            return samples * 90000 / srs_aac_srates[rate_index];
-        }
-    }
-
-    // For MP3 and the AAC profiles above, use the cadence of audio packets in
-    // the same clock that generated their DTS. A backward or oversized jump is
-    // a discontinuity, not a packet duration.
-    if (audio_last_dts_ >= 0 && dts > audio_last_dts_) {
-        int64_t delta = dts - audio_last_dts_;
-        if (delta <= SRS_CONSTS_HLS_PURE_AUDIO_AGGREGATE) {
-            return delta;
-        }
-    }
-
-    return 0;
 }
 
 srs_error_t SrsTsMessageCache::cache_audio(SrsAudioFrame* frame, int64_t dts)
@@ -2909,15 +2863,6 @@ srs_error_t SrsTsMessageCache::cache_audio(SrsAudioFrame* frame, int64_t dts)
             return srs_error_wrap(err, "ts: cache mp3");
         }
     }
-
-    // Track the media end of this aggregate only after its payload was
-    // accepted. The packet cadence is always from the last cached packet, so a
-    // rejected frame cannot make future media look written.
-    int64_t duration = audio_packet_duration(frame, dts);
-    if (duration > 0) {
-        audio->end_dts = dts + duration;
-    }
-    audio_last_dts_ = dts;
 
     return err;
 }

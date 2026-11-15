@@ -15,6 +15,8 @@ using namespace std;
 #include <srs_app_hls.hpp>
 #include <srs_kernel_codec.hpp>
 #include <srs_kernel_ts.hpp>
+#include <srs_kernel_flv.hpp>
+#include <srs_kernel_buffer.hpp>
 #include <srs_protocol_rtmp_stack.hpp>
 #include <srs_utest_config.hpp>
 
@@ -800,9 +802,13 @@ VOID TEST(AppSecurity, CheckSecurity)
 // codec change must keep the media that was already written.
 
 #define SRS_UT70_TS_PMT_PID 0x1001
+#define SRS_UT70_TS_VIDEO_PID 0x100
+#define SRS_UT70_TS_AUDIO_AAC_PID 0x101
+#define SRS_UT70_TS_AUDIO_MP3_PID 0x102
 #define SRS_UT70_STREAM_TYPE_H264 0x1B
 #define SRS_UT70_STREAM_TYPE_HEVC 0x24
 #define SRS_UT70_STREAM_TYPE_AAC 0x0F
+#define SRS_UT70_STREAM_TYPE_MP3 0x03
 #define SRS_UT70_PAYLOAD_SIZE 16384
 
 // Restore the global config even when a fatal ASSERT_* exits the test body.
@@ -904,7 +910,132 @@ static bool srs_ut70_has_stream_type(const std::vector<int>& types, int stream_t
     return false;
 }
 
-static void srs_ut70_flush_audio(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, int64_t dts)
+// Find the first PES packet start for pid and decode its DTS (90kHz). Returns
+// the byte offset of that TS packet, or -1 when the segment has no such PES.
+static int srs_ut70_first_pes_dts(const std::string& data, int pid, int64_t* dts)
+{
+    for (size_t offset = 0; offset + SRS_TS_PACKET_SIZE <= data.size(); offset += SRS_TS_PACKET_SIZE) {
+        const unsigned char* packet = (const unsigned char*)data.data() + offset;
+        if (packet[0] != 0x47) continue;
+
+        int packet_pid = ((packet[1] & 0x1F) << 8) | packet[2];
+        if (packet_pid != pid) continue;
+        if (!(packet[1] & 0x40)) continue;
+
+        int adaptation = (packet[3] >> 4) & 0x03;
+        int index = 4;
+        if (adaptation & 0x02) {
+            index += 1 + packet[4];
+        }
+        if (!(adaptation & 0x01) || index + 9 > SRS_TS_PACKET_SIZE) continue;
+
+        SrsBuffer stream((char*)packet + index, SRS_TS_PACKET_SIZE - index);
+        SrsMpegPES pes;
+        srs_error_t err = pes.decode(&stream);
+        if (err != srs_success) {
+            srs_freep(err);
+            continue;
+        }
+
+        if (dts) *dts = pes.dts;
+        return (int)offset;
+    }
+
+    return -1;
+}
+
+// Whether the data contains a run of value with at least length bytes. TS
+// payloads are packed contiguously inside each packet, so a short run of the
+// audio fill byte proves the media payload reached the segment.
+static bool srs_ut70_contains_run(const std::string& data, unsigned char value, int length)
+{
+    int run = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+        if ((unsigned char)data.at(i) == value) {
+            if (++run >= length) return true;
+        } else {
+            run = 0;
+        }
+    }
+    return false;
+}
+
+// Count the payload-unit starts of pid, which are the PES packet starts.
+static int srs_ut70_count_pes_starts(const std::string& data, int pid)
+{
+    int count = 0;
+    for (size_t offset = 0; offset + SRS_TS_PACKET_SIZE <= data.size(); offset += SRS_TS_PACKET_SIZE) {
+        const unsigned char* packet = (const unsigned char*)data.data() + offset;
+        if (packet[0] != 0x47) continue;
+
+        int packet_pid = ((packet[1] & 0x1F) << 8) | packet[2];
+        if (packet_pid != pid) continue;
+        if (packet[1] & 0x40) count++;
+    }
+    return count;
+}
+
+// Build the audio side of a real SrsFormat for SrsHls::on_audio. The format
+// owns the codec and frame objects.
+static void srs_ut70_initialize_audio_format(SrsFormat* format, SrsAudioCodecId id)
+{
+    format->acodec = new SrsAudioCodecConfig();
+    format->acodec->id = id;
+    format->acodec->sound_rate = SrsAudioSampleRate44100;
+    if (id == SrsAudioCodecIdAAC) {
+        format->acodec->aac_object = SrsAacObjectTypeAacLC;
+        format->acodec->aac_sample_rate = 4; // 44100Hz in srs_aac_srates.
+        format->acodec->aac_channels = 2;
+    }
+
+    format->audio = new SrsAudioFrame();
+}
+
+static void srs_ut70_set_audio_frame(SrsFormat* format, SrsAudioAacFrameTrait trait, char* sample, int size)
+{
+    srs_error_t err = format->audio->initialize(format->acodec);
+    srs_freep(err);
+    format->audio->aac_packet_type = trait;
+    err = format->audio->add_sample(sample, size);
+    srs_freep(err);
+}
+
+static void srs_ut70_initialize_video_format(SrsFormat* format, SrsVideoCodecId id)
+{
+    format->vcodec = new SrsVideoCodecConfig();
+    format->vcodec->id = id;
+
+    format->video = new SrsVideoFrame();
+    srs_error_t err = format->video->initialize(format->vcodec);
+    srs_freep(err);
+}
+
+// A shared message with the given timestamp, as SrsHls receives from the hub.
+static SrsSharedPtrMessage* srs_ut70_message(bool audio, int64_t timestamp, int size)
+{
+    char* payload = new char[size];
+    memset(payload, 0x55, size);
+
+    SrsMessageHeader header;
+    if (audio) {
+        header.initialize_audio(size, (uint32_t)timestamp, 1);
+    } else {
+        header.initialize_video(size, (uint32_t)timestamp, 1);
+    }
+
+    SrsSharedPtrMessage* msg = new SrsSharedPtrMessage();
+    srs_error_t err = msg->create(&header, payload, size);
+    if (err != srs_success) {
+        srs_freep(err);
+        srs_freep(msg);
+        return NULL;
+    }
+
+    return msg;
+}
+
+static void srs_ut70_flush_audio_with(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, int64_t dts,
+    char fill, int size)
 {
     srs_error_t err = srs_success;
 
@@ -913,11 +1044,16 @@ static void srs_ut70_flush_audio(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, i
     audio->write_pcr = false;
     audio->sid = SrsTsPESStreamIdAudioCommon;
 
-    std::string payload(SRS_UT70_PAYLOAD_SIZE, '\0');
+    std::string payload(size, fill);
     audio->payload->append(payload.data(), (int)payload.size());
 
     cache->audio = audio;
     HELPER_ASSERT_SUCCESS(muxer->flush_audio(cache));
+}
+
+static void srs_ut70_flush_audio(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, int64_t dts)
+{
+    srs_ut70_flush_audio_with(muxer, cache, dts, '\0', SRS_UT70_PAYLOAD_SIZE);
 }
 
 static void srs_ut70_flush_video(SrsHlsMuxer* muxer, SrsTsMessageCache* cache, int64_t dts)
@@ -1601,18 +1737,18 @@ VOID TEST(HlsControllerTest, AudioOnlyPreludeThenVideoStartsWithHevcPmt)
     }
 }
 
-// The natural absolute overflow reaps the prelude and flushes the triggering
+// The natural audio overflow reaps the prelude and flushes the triggering
 // audio aggregate into the new segment. Until another audio frame arrives that
 // segment has only the aggregate's start DTS, so its measured duration is zero.
-// Discovering HEVC in that exact window must not advertise an EXTINF of zero:
-// the retained audio segment needs a positive, truthful duration and the next
-// segment must start with the real codec before the first video packet.
-VOID TEST(HlsControllerTest, AudioOverflowBoundaryDiscoveryKeepsPositiveDuration)
+// Discovering HEVC on the first real video frame must reopen the segment with
+// the real codec, replay the retained audio and keep the first keyframe, with
+// no separate zero-duration playlist entry.
+VOID TEST(HlsControllerTest, AudioOverflowBoundaryMediaDiscoveryReplaysRetainedAudio)
 {
     srs_error_t err = srs_success;
 
     std::stringstream dir_ss;
-    dir_ss << _srs_tmp_file_prefix << "issue70-boundary-controller-" << srs_update_system_time();
+    dir_ss << _srs_tmp_file_prefix << "issue70-boundary-media-" << srs_update_system_time();
     std::string dir = dir_ss.str();
     std::stringstream conf_ss;
     conf_ss << "listen 1935;"
@@ -1636,7 +1772,7 @@ VOID TEST(HlsControllerTest, AudioOverflowBoundaryDiscoveryKeepsPositiveDuration
     SrsRequest req;
     req.vhost = "__defaultVhost__";
     req.app = "live";
-    req.stream = "boundary-controller";
+    req.stream = "boundary-media";
 
     HELPER_ASSERT_SUCCESS(controller.on_publish(&req));
 
@@ -1652,7 +1788,7 @@ VOID TEST(HlsControllerTest, AudioOverflowBoundaryDiscoveryKeepsPositiveDuration
     memset(abytes, 0x55, sizeof(abytes));
     HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
 
-    std::string m3u8 = dir + "/boundary-controller.m3u8";
+    std::string m3u8 = dir + "/boundary-media.m3u8";
 
     // Write audio until the natural absolute overflow advertises the first
     // audio-only prelude segment. The triggering aggregate is flushed into the
@@ -1674,13 +1810,10 @@ VOID TEST(HlsControllerTest, AudioOverflowBoundaryDiscoveryKeepsPositiveDuration
 
     // The new segment holds the flushed aggregate but has not been advertised
     // and has not advanced its duration with a later audio frame.
-    std::string audio_uri = controller.ts_url();
-    EXPECT_TRUE(prelude_uri != audio_uri);
+    std::string retained_uri = controller.ts_url();
+    int64_t retained_start = pts - 1920;
+    EXPECT_TRUE(prelude_uri != retained_uri);
     ASSERT_EQ(1, (int)srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8)).size());
-
-    // The sequence header discovers HEVC immediately, in the zero-duration
-    // window, before any further audio frame.
-    HELPER_ASSERT_SUCCESS(controller.update_video_codec(SrsVideoCodecIdHEVC));
 
     SrsVideoCodecConfig vcodec;
     vcodec.id = SrsVideoCodecIdHEVC;
@@ -1693,47 +1826,43 @@ VOID TEST(HlsControllerTest, AudioOverflowBoundaryDiscoveryKeepsPositiveDuration
     char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
     HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
 
-    // The first real video frame supplies the segment boundary. The audio
-    // segment must be finalized before this frame is written, and the video
-    // must go to a new segment whose first PMT is HEVC.
+    // The first real video frame carries the discovery. write_video must
+    // update the codec, reopen the retained segment and still write the
+    // keyframe into it.
     int64_t video_dts = pts;
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts));
-
-    std::string video_uri = controller.ts_url();
-    EXPECT_TRUE(audio_uri != video_uri);
-
-    std::string audio_after = srs_ut70_read_file(dir + "/" + audio_uri);
-    ASSERT_TRUE(!audio_after.empty());
-
-    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(audio_after);
-    ASSERT_TRUE(!groups.empty());
-    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
-    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_EQ(retained_uri, controller.ts_url());
 
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts + 180000));
     HELPER_ASSERT_SUCCESS(controller.on_unpublish());
 
-    std::string published = srs_ut70_read_file(dir + "/" + video_uri);
-    ASSERT_TRUE(!published.empty());
-    groups = srs_ut70_pmt_stream_types(published);
-    ASSERT_TRUE(!groups.empty());
-    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
-    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
-
-    // The retained audio segment must have a positive duration that reflects
-    // its actual media, and the first video-bearing segment must start after
-    // it with HEVC.
     advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
-    ASSERT_TRUE(advertised.size() >= 3);
+    ASSERT_EQ(2, (int)advertised.size());
     EXPECT_EQ(prelude_uri, advertised.at(0).second);
-    EXPECT_EQ(audio_uri, advertised.at(1).second);
-    EXPECT_EQ(video_uri, advertised.at(2).second);
-    EXPECT_TRUE(advertised.at(1).first > 0);
-    EXPECT_TRUE(advertised.at(1).first < 1.0);
-    EXPECT_TRUE(advertised.at(2).first >= 1.0);
+    EXPECT_EQ(retained_uri, advertised.at(1).second);
     for (size_t i = 0; i < advertised.size(); i++) {
         EXPECT_TRUE(advertised.at(i).first > 0);
     }
+    EXPECT_TRUE(advertised.at(1).first >= 1.0);
+
+    std::string published = srs_ut70_read_file(dir + "/" + retained_uri);
+    ASSERT_TRUE(!published.empty());
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    int64_t audio_dts = -1;
+    int audio_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_AUDIO_AAC_PID, &audio_dts);
+    int64_t published_video_dts = -1;
+    int video_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_VIDEO_PID, &published_video_dts);
+    ASSERT_GE(audio_offset, 0);
+    ASSERT_GE(video_offset, 0);
+    EXPECT_EQ(retained_start, audio_dts);
+    EXPECT_LT(audio_offset, video_offset);
+    EXPECT_TRUE(srs_ut70_contains_run(published, 0x55, 32));
 }
 
 // The video DTS relationship to the retained audio segment's start DTS. Audio
@@ -1751,10 +1880,11 @@ enum SrsUt70BoundaryDtsMode
 struct SrsUt70BoundaryResult
 {
     bool valid;
+    bool replayed;
     int64_t retained_start_dts;
     int64_t video_dts;
     std::string prelude_uri;
-    std::string audio_uri;
+    std::string current_uri;
     std::string video_uri;
     std::vector<std::pair<double, std::string> > entries;
     double prelude_extinf;
@@ -1763,9 +1893,13 @@ struct SrsUt70BoundaryResult
     int audio_bytes;
     std::vector<int> audio_first_pmt;
     std::vector<int> video_first_pmt;
+    int audio_pes_offset;
+    int video_pes_offset;
+    int64_t audio_pes_dts;
     bool playlist_prelude_only;
-    SrsUt70BoundaryResult() : valid(false), retained_start_dts(-1), video_dts(-1),
+    SrsUt70BoundaryResult() : valid(false), replayed(false), retained_start_dts(-1), video_dts(-1),
         prelude_extinf(0), audio_extinf(0), video_extinf(0), audio_bytes(0),
+        audio_pes_offset(-1), video_pes_offset(-1), audio_pes_dts(-1),
         playlist_prelude_only(false)
     {
     }
@@ -1851,8 +1985,8 @@ static void srs_ut70_run_boundary_matrix(const std::string& name, SrsUt70Boundar
     ASSERT_EQ(1, (int)advertised.size());
     r.prelude_uri = advertised.at(0).second;
     r.prelude_extinf = advertised.at(0).first;
-    r.audio_uri = controller.ts_url();
-    r.playlist_prelude_only = r.prelude_uri != r.audio_uri;
+    r.current_uri = controller.ts_url();
+    r.playlist_prelude_only = r.prelude_uri != r.current_uri;
 
     // More audio frames may advance the segment's measured duration before the
     // codec is discovered; this is the multi-frame control.
@@ -1880,6 +2014,20 @@ static void srs_ut70_run_boundary_matrix(const std::string& name, SrsUt70Boundar
     // yet and the header carries no timestamp.
     HELPER_ASSERT_SUCCESS(controller.update_video_codec(SrsVideoCodecIdHEVC));
 
+    // A zero-duration retained segment is reopened in place with the real
+    // codec and its retained audio replayed, so no separate audio-only entry is
+    // advertised. A segment whose duration is already measured keeps the
+    // existing close/open path and is advertised as positive-duration media.
+    r.replayed = controller.ts_url() == r.current_uri;
+    if (!r.replayed) {
+        std::string audio_after = srs_ut70_read_file(dir + "/" + r.current_uri);
+        r.audio_bytes = (int)audio_after.size();
+        std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(audio_after);
+        if (!groups.empty()) {
+            r.audio_first_pmt = groups.at(0);
+        }
+    }
+
     SrsVideoCodecConfig vcodec;
     vcodec.id = SrsVideoCodecIdHEVC;
 
@@ -1893,31 +2041,29 @@ static void srs_ut70_run_boundary_matrix(const std::string& name, SrsUt70Boundar
 
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts));
     r.video_uri = controller.ts_url();
-    ASSERT_TRUE(r.video_uri != r.audio_uri);
-
-    // The retained audio segment is finalized and readable now. It must keep
-    // its AAC media and never carry the HEVC program map.
-    std::string audio_after = srs_ut70_read_file(dir + "/" + r.audio_uri);
-    r.audio_bytes = (int)audio_after.size();
-    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(audio_after);
-    if (!groups.empty()) {
-        r.audio_first_pmt = groups.at(0);
-    }
 
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, video_dts + 180000));
     HELPER_ASSERT_SUCCESS(controller.on_unpublish());
 
     std::string published = srs_ut70_read_file(dir + "/" + r.video_uri);
-    groups = srs_ut70_pmt_stream_types(published);
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(published);
     if (!groups.empty()) {
         r.video_first_pmt = groups.at(0);
     }
+
+    // The audio PES and the first video keyframe both belong to the published
+    // video-bearing segment only when the retained audio was replayed.
+    r.audio_pes_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_AUDIO_AAC_PID, &r.audio_pes_dts);
+    int64_t video_pes_dts = 0;
+    r.video_pes_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_VIDEO_PID, &video_pes_dts);
 
     r.entries = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
     for (size_t i = 0; i < r.entries.size(); i++) {
         if (r.entries.at(i).second == r.prelude_uri) {
             r.prelude_extinf = r.entries.at(i).first;
-        } else if (r.entries.at(i).second == r.audio_uri) {
+        } else if (r.replayed && r.entries.at(i).second == r.video_uri) {
+            r.video_extinf = r.entries.at(i).first;
+        } else if (!r.replayed && r.entries.at(i).second == r.current_uri) {
             r.audio_extinf = r.entries.at(i).first;
         } else if (r.entries.at(i).second == r.video_uri) {
             r.video_extinf = r.entries.at(i).first;
@@ -1927,344 +2073,245 @@ static void srs_ut70_run_boundary_matrix(const std::string& name, SrsUt70Boundar
     r.valid = true;
 }
 
-// The common contract of the boundary matrix: the prelude is retained, the
-// finalized audio segment keeps its AAC media, the first video-bearing segment
-// starts with the real HEVC program map, and the playlist is ordered and does
-// not contain a zero-duration entry.
-static void srs_ut70_expect_boundary(const SrsUt70BoundaryResult& r, double min_audio_extinf)
+// The common contract of the boundary: the prelude is kept, the playlist has
+// no zero-duration entry, and the first video-bearing segment starts with the
+// real HEVC program map.
+static void srs_ut70_expect_boundary_common(const SrsUt70BoundaryResult& r)
 {
     ASSERT_TRUE(r.valid);
     EXPECT_TRUE(r.playlist_prelude_only);
+    EXPECT_TRUE(srs_ut70_has_stream_type(r.video_first_pmt, SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(r.video_first_pmt, SRS_UT70_STREAM_TYPE_H264));
+    EXPECT_GT(r.prelude_extinf, 0.0);
+    EXPECT_GE(r.video_extinf, 1.0);
+    for (size_t i = 0; i < r.entries.size(); i++) {
+        EXPECT_GT(r.entries.at(i).first, 0.0);
+    }
+}
+
+// A zero-duration unadvertised segment is reopened with the discovered codec,
+// its audio replayed before the first video keyframe, and then advertised as
+// part of the video-bearing segment. The payload and timestamps are preserved.
+static void srs_ut70_expect_replay_boundary(const SrsUt70BoundaryResult& r)
+{
+    srs_ut70_expect_boundary_common(r);
+
+    EXPECT_TRUE(r.replayed);
+    EXPECT_EQ(r.current_uri, r.video_uri);
+    EXPECT_TRUE(srs_ut70_has_stream_type(r.video_first_pmt, SRS_UT70_STREAM_TYPE_AAC));
+
+    ASSERT_TRUE(r.entries.size() >= 2);
+    EXPECT_EQ(r.prelude_uri, r.entries.at(0).second);
+    EXPECT_EQ(r.video_uri, r.entries.at(1).second);
+
+    EXPECT_GE(r.audio_pes_offset, 0);
+    EXPECT_GE(r.video_pes_offset, 0);
+    EXPECT_LT(r.audio_pes_offset, r.video_pes_offset);
+    EXPECT_EQ(r.retained_start_dts, r.audio_pes_dts);
+}
+
+// A retained segment whose duration is already measured keeps its existing
+// positive-duration audio-only entry; its audio is not replayed into the video
+// segment.
+static void srs_ut70_expect_kept_audio_entry(const SrsUt70BoundaryResult& r, double min_audio_extinf)
+{
+    srs_ut70_expect_boundary_common(r);
+
+    EXPECT_TRUE(!r.replayed);
     EXPECT_GT(r.audio_bytes, 0);
     EXPECT_TRUE(srs_ut70_has_stream_type(r.audio_first_pmt, SRS_UT70_STREAM_TYPE_AAC));
     EXPECT_TRUE(!srs_ut70_has_stream_type(r.audio_first_pmt, SRS_UT70_STREAM_TYPE_HEVC));
-    EXPECT_TRUE(srs_ut70_has_stream_type(r.video_first_pmt, SRS_UT70_STREAM_TYPE_HEVC));
-    EXPECT_TRUE(!srs_ut70_has_stream_type(r.video_first_pmt, SRS_UT70_STREAM_TYPE_H264));
 
     ASSERT_TRUE(r.entries.size() >= 3);
     EXPECT_EQ(r.prelude_uri, r.entries.at(0).second);
-    EXPECT_EQ(r.audio_uri, r.entries.at(1).second);
+    EXPECT_EQ(r.current_uri, r.entries.at(1).second);
     EXPECT_EQ(r.video_uri, r.entries.at(2).second);
-    EXPECT_GT(r.prelude_extinf, 0.0);
-    EXPECT_GE(r.video_extinf, 1.0);
+    EXPECT_GT(r.audio_extinf, 0.0);
+    EXPECT_GE(r.audio_extinf, min_audio_extinf);
 
-    // The requirement under test: a retained audio segment with actual media
-    // must never be advertised with a zero (or fabricated) duration.
-    EXPECT_GT(r.audio_extinf, 0.0)
-        << "retained_start=" << r.retained_start_dts << " video_dts=" << r.video_dts
-        << " audio_extinf=" << r.audio_extinf;
-    EXPECT_GE(r.audio_extinf, min_audio_extinf)
-        << "retained_start=" << r.retained_start_dts << " video_dts=" << r.video_dts
-        << " audio_extinf=" << r.audio_extinf;
+    EXPECT_LT(r.audio_pes_offset, 0);
 }
 
-TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsEqualKeepsPositiveDuration)
+TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsEqualReplaysRetainedAudio)
 {
     SrsUt70BoundaryResult r;
     srs_ut70_run_boundary_matrix("equal", SrsUt70BoundaryDtsEqual, 0, r);
-    srs_ut70_expect_boundary(r, 0.0);
+    srs_ut70_expect_replay_boundary(r);
 }
 
-TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsEarlierKeepsPositiveDuration)
+TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsEarlierReplaysRetainedAudio)
 {
     SrsUt70BoundaryResult r;
     srs_ut70_run_boundary_matrix("earlier", SrsUt70BoundaryDtsEarlier, 0, r);
-    srs_ut70_expect_boundary(r, 0.0);
+    srs_ut70_expect_replay_boundary(r);
 }
 
-TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsSameMillisecondKeepsPositiveDuration)
+TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsSameMillisecondReplaysRetainedAudio)
 {
     SrsUt70BoundaryResult r;
     srs_ut70_run_boundary_matrix("same-ms", SrsUt70BoundaryDtsSameMillisecond, 0, r);
-    srs_ut70_expect_boundary(r, 0.0);
+    srs_ut70_expect_replay_boundary(r);
 }
 
-TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsLaterKeepsPositiveDuration)
+TEST(HlsControllerTest, AudioOverflowBoundaryVideoDtsLaterReplaysRetainedAudio)
 {
     SrsUt70BoundaryResult r;
     srs_ut70_run_boundary_matrix("later", SrsUt70BoundaryDtsLater, 0, r);
-    srs_ut70_expect_boundary(r, 0.0);
+    srs_ut70_expect_replay_boundary(r);
 }
 
 TEST(HlsControllerTest, AudioOverflowBoundaryMultiAudioFrameKeepsPositiveDuration)
 {
     SrsUt70BoundaryResult r;
     srs_ut70_run_boundary_matrix("multi-audio", SrsUt70BoundaryDtsEqual, 35, r);
-    srs_ut70_expect_boundary(r, 0.5);
+    srs_ut70_expect_kept_audio_entry(r, 0.5);
 }
 
 // With the default video codec enabled, audio is flushed packet by packet.
 // With the configured video codec disabled (pure audio), the cache aggregates
-// several packets into one TS message; the same boundary must still be measured
-// by the media end of the aggregate actually written.
-TEST(HlsControllerTest, AudioOverflowBoundaryPureAudioAggregationKeepsPositiveDuration)
+// several packets into one TS message; the same boundary must replay that
+// aggregate into the segment reopened with the real codec.
+TEST(HlsControllerTest, AudioOverflowBoundaryPureAudioAggregationReplaysRetainedAudio)
 {
     SrsUt70BoundaryResult r;
     srs_ut70_run_boundary_matrix("pure-audio", SrsUt70BoundaryDtsEqual, 0, r, true);
-    srs_ut70_expect_boundary(r, 0.0);
+    srs_ut70_expect_replay_boundary(r);
 }
 
-// The cache owns the media end of an audio aggregate, including the packets
-// after the one whose DTS becomes the message start.
-TEST(HlsTsCacheTest, AudioAggregateEndUsesLastAacPacket)
+// A retained segment may hold more than one written aggregate when the audio
+// timing does not advance (or regresses) before the codec is discovered. All
+// of them are replayed, in write order, with their original timestamps.
+VOID TEST(HlsMuxerTest, RetainedAudioReplaysEveryMessageInOrder)
 {
     srs_error_t err = srs_success;
 
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
+
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsHlsMuxer muxer;
     SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "replay-order";
 
-    SrsAudioCodecConfig acodec;
-    acodec.id = SrsAudioCodecIdAAC;
-    acodec.aac_object = SrsAacObjectTypeAacLC;
-    acodec.aac_sample_rate = 3; // 48000 Hz
-    acodec.aac_channels = 2;
+    std::string dir = _srs_tmp_file_prefix + "issue70-replay-order";
+    srs_ut70_configure(&muxer, &req, dir);
 
-    SrsAudioFrame frame;
-    HELPER_ASSERT_SUCCESS(frame.initialize(&acodec));
-    char bytes[128];
-    memset(bytes, 0x55, sizeof(bytes));
-    HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
+    // Advertise an audio-only prelude, then keep the next segment unwritten
+    // with respect to its measured duration.
+    srs_ut70_flush_audio(&muxer, &cache, 0);
+    srs_ut70_flush_audio(&muxer, &cache, 27000);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+    HELPER_ASSERT_SUCCESS(muxer.segment_open());
 
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 0));
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 1920));
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 3840));
+    int64_t start = 36000;
+    srs_ut70_flush_audio_with(&muxer, &cache, start, 'A', 1024);
+    srs_ut70_flush_audio_with(&muxer, &cache, start, 'B', 1024);
 
-    ASSERT_TRUE(cache.audio != NULL);
-    // The message keeps the first packet's start and DTS, while its media end
-    // is the end of the last packet actually aggregated into it.
-    EXPECT_EQ((int64_t)0, cache.audio->start_pts);
-    EXPECT_EQ((int64_t)0, cache.audio->dts);
-    EXPECT_EQ((int64_t)5760, cache.audio->end_dts);
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    std::string uri = muxer.ts_url();
+
+    srs_ut70_flush_video(&muxer, &cache, start);
+    srs_ut70_flush_video(&muxer, &cache, start + 180000);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    std::string published = srs_ut70_read_file(dir + "/" + uri);
+    ASSERT_TRUE(!published.empty());
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    EXPECT_EQ(2, srs_ut70_count_pes_starts(published, SRS_UT70_TS_AUDIO_AAC_PID));
+
+    int64_t first_dts = -1;
+    int audio_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_AUDIO_AAC_PID, &first_dts);
+    ASSERT_GE(audio_offset, 0);
+    EXPECT_EQ(start, first_dts);
+
+    int64_t video_dts = -1;
+    int video_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_VIDEO_PID, &video_dts);
+    ASSERT_GE(video_offset, 0);
+    EXPECT_LT(audio_offset, video_offset);
+
+    // Both retained messages kept their payload.
+    EXPECT_TRUE(srs_ut70_contains_run(published, 'A', 32));
+    EXPECT_TRUE(srs_ut70_contains_run(published, 'B', 32));
+
+    muxer.dispose();
 }
 
-// AAC packet duration comes from the AudioSpecificConfig sampling frequency
-// and the number of raw AAC frames, not from the FLV SoundRate tag.
-TEST(HlsTsCacheTest, AudioAacEndUsesConfiguredRateAndFrameCount)
+// Retention is bounded: a source that keeps writing audio into the current
+// unadvertised segment without advancing its timing must fail explicitly when
+// the bounded replay cache is exhausted, instead of growing memory without
+// bound or discarding the media silently.
+VOID TEST(HlsMuxerTest, RetainedAudioBoundFailsExplicitly)
 {
     srs_error_t err = srs_success;
 
-    char bytes[128];
-    memset(bytes, 0x55, sizeof(bytes));
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(_MIN_OK_CONF));
 
-    // Two raw_data_blocks of 1024 samples at 44.1 kHz: 2048*90000/44100 ticks.
-    {
-        SrsTsMessageCache cache;
-        SrsAudioCodecConfig acodec;
-        acodec.id = SrsAudioCodecIdAAC;
-        acodec.aac_object = SrsAacObjectTypeAacLC;
-        acodec.aac_sample_rate = 4; // 44100 Hz
-        acodec.sound_rate = SrsAudioSampleRate22050;
+    SrsUt70ConfigGuard config_guard(&conf);
 
-        SrsAudioFrame frame;
-        HELPER_ASSERT_SUCCESS(frame.initialize(&acodec));
-        HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
-        HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
-        HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 0));
+    SrsHlsMuxer muxer;
+    SrsTsMessageCache cache;
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "replay-bound";
 
-        ASSERT_TRUE(cache.audio != NULL);
-        EXPECT_EQ((int64_t)4179, cache.audio->end_dts);
+    std::string dir = _srs_tmp_file_prefix + "issue70-replay-bound";
+    srs_ut70_configure(&muxer, &req, dir);
+
+    srs_ut70_flush_audio(&muxer, &cache, 0);
+    srs_ut70_flush_audio(&muxer, &cache, 27000);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+    HELPER_ASSERT_SUCCESS(muxer.segment_open());
+
+    // Fill the replay cache exactly, with a non-advancing timestamp so every
+    // message stays retained.
+    const int max_bytes = 4 * 1024 * 1024;
+    const int payload_size = SRS_UT70_PAYLOAD_SIZE;
+    for (int i = 0; i < max_bytes / payload_size; i++) {
+        srs_ut70_flush_audio_with(&muxer, &cache, 36000, 'A', payload_size);
     }
 
-    // One raw_data_block at 8 kHz.
-    {
-        SrsTsMessageCache cache;
-        SrsAudioCodecConfig acodec;
-        acodec.id = SrsAudioCodecIdAAC;
-        acodec.aac_object = SrsAacObjectTypeAacLC;
-        acodec.aac_sample_rate = 11; // 8000 Hz
-        acodec.sound_rate = SrsAudioSampleRate44100;
+    // The next message would exceed the bound.
+    SrsTsMessage* audio = new SrsTsMessage();
+    audio->dts = audio->pts = audio->start_pts = 36000;
+    audio->sid = SrsTsPESStreamIdAudioCommon;
+    std::string payload(payload_size, 'B');
+    audio->payload->append(payload.data(), (int)payload.size());
+    cache.audio = audio;
 
-        SrsAudioFrame frame;
-        HELPER_ASSERT_SUCCESS(frame.initialize(&acodec));
-        HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
-        HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 1000));
-
-        ASSERT_TRUE(cache.audio != NULL);
-        EXPECT_EQ((int64_t)12520, cache.audio->end_dts);
-    }
-}
-
-// Profiles and sampling-frequency indexes whose frame length is not modeled
-// use the validated packet cadence instead of a guessed 1024 samples.
-TEST(HlsTsCacheTest, AudioAacUnsupportedFrameMetadataFallsBackToCadence)
-{
-    srs_error_t err = srs_success;
-
-    char bytes[128];
-    memset(bytes, 0x55, sizeof(bytes));
-
-    // HE-AAC has no supported 1024-sample frame length in this cache.
-    {
-        SrsTsMessageCache cache;
-        SrsAudioCodecConfig acodec;
-        acodec.id = SrsAudioCodecIdAAC;
-        acodec.aac_object = SrsAacObjectTypeAacHE;
-        acodec.aac_sample_rate = 4; // 44100 Hz
-
-        SrsAudioFrame frame;
-        HELPER_ASSERT_SUCCESS(frame.initialize(&acodec));
-        HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
-        HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 0));
-
-        ASSERT_TRUE(cache.audio != NULL);
-        EXPECT_EQ((int64_t)0, cache.audio->end_dts);
-
-        HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 2090));
-        EXPECT_EQ((int64_t)4180, cache.audio->end_dts);
-    }
-
-    // An unset sampling-frequency index is not guessed from the FLV tag.
-    {
-        SrsTsMessageCache cache;
-        SrsAudioCodecConfig acodec;
-        acodec.id = SrsAudioCodecIdAAC;
-        acodec.aac_object = SrsAacObjectTypeAacLC;
-        acodec.aac_sample_rate = SrsAacSampleRateUnset;
-        acodec.sound_rate = SrsAudioSampleRate44100;
-
-        SrsAudioFrame frame;
-        HELPER_ASSERT_SUCCESS(frame.initialize(&acodec));
-        HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
-        HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 0));
-
-        ASSERT_TRUE(cache.audio != NULL);
-        EXPECT_EQ((int64_t)0, cache.audio->end_dts);
-
-        HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 1920));
-        EXPECT_EQ((int64_t)3840, cache.audio->end_dts);
-    }
-}
-
-// MP3 has no frame parser here; its packet duration is the validated cadence
-// of the same audio clock, and a timestamp discontinuity does not become a
-// packet duration.
-TEST(HlsTsCacheTest, AudioMp3EndUsesValidatedCadence)
-{
-    srs_error_t err = srs_success;
-
-    SrsTsMessageCache cache;
-
-    SrsAudioCodecConfig acodec;
-    acodec.id = SrsAudioCodecIdMP3;
-    acodec.sound_rate = SrsAudioSampleRate44100;
-
-    SrsAudioFrame frame;
-    HELPER_ASSERT_SUCCESS(frame.initialize(&acodec));
-    char bytes[128];
-    memset(bytes, 0x55, sizeof(bytes));
-    HELPER_ASSERT_SUCCESS(frame.add_sample(bytes, (int)sizeof(bytes)));
-
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 0));
-    ASSERT_TRUE(cache.audio != NULL);
-    EXPECT_EQ((int64_t)0, cache.audio->end_dts);
-
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 2090));
-    EXPECT_EQ((int64_t)4180, cache.audio->end_dts);
-
-    // A backward jump is a discontinuity, not a negative packet duration.
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 1000));
-    EXPECT_EQ((int64_t)4180, cache.audio->end_dts);
-
-    // The cadence restarts from the new position.
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&frame, 3090));
-    EXPECT_EQ((int64_t)5180, cache.audio->end_dts);
-}
-
-// Publish and audio codec changes reset the cadence history.
-TEST(HlsTsCacheTest, AudioTimingResetDropsCodecCadence)
-{
-    srs_error_t err = srs_success;
-
-    SrsTsMessageCache cache;
-    char bytes[128];
-    memset(bytes, 0x55, sizeof(bytes));
-
-    SrsAudioCodecConfig aac;
-    aac.id = SrsAudioCodecIdAAC;
-    aac.aac_object = SrsAacObjectTypeAacLC;
-    aac.aac_sample_rate = 3; // 48000 Hz
-    SrsAudioFrame aframe;
-    HELPER_ASSERT_SUCCESS(aframe.initialize(&aac));
-    HELPER_ASSERT_SUCCESS(aframe.add_sample(bytes, (int)sizeof(bytes)));
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&aframe, 0));
-
-    // The muxer flushes the aggregate, then the audio codec changes.
-    srs_freep(cache.audio);
-    cache.reset_audio_timing();
-
-    SrsAudioCodecConfig mp3;
-    mp3.id = SrsAudioCodecIdMP3;
-    mp3.sound_rate = SrsAudioSampleRate44100;
-    SrsAudioFrame mframe;
-    HELPER_ASSERT_SUCCESS(mframe.initialize(&mp3));
-    HELPER_ASSERT_SUCCESS(mframe.add_sample(bytes, (int)sizeof(bytes)));
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&mframe, 1920));
-
-    // Without the reset, the MP3 packet would inherit the AAC packet cadence
-    // and get an end of 3840.
-    ASSERT_TRUE(cache.audio != NULL);
-    EXPECT_EQ((int64_t)0, cache.audio->end_dts);
-}
-
-// A rejected or empty frame must not become the media end reference for
-// future media, although the audio clock may still advance.
-TEST(HlsTsCacheTest, AudioRejectedOrEmptyPacketDoesNotAdvanceMediaEnd)
-{
-    srs_error_t err = srs_success;
-
-    SrsTsMessageCache cache;
-
-    SrsAudioCodecConfig mp3;
-    mp3.id = SrsAudioCodecIdMP3;
-    mp3.sound_rate = SrsAudioSampleRate44100;
-    SrsAudioFrame mframe;
-    char mbytes[128];
-    memset(mbytes, 0x55, sizeof(mbytes));
-    HELPER_ASSERT_SUCCESS(mframe.initialize(&mp3));
-    HELPER_ASSERT_SUCCESS(mframe.add_sample(mbytes, (int)sizeof(mbytes)));
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&mframe, 0));
-
-    // This AAC sample is too large for an ADTS header, so cache_audio rejects
-    // it before it can update the packet timing.
-    SrsAudioCodecConfig aac;
-    aac.id = SrsAudioCodecIdAAC;
-    aac.aac_object = SrsAacObjectTypeAacLC;
-    aac.aac_sample_rate = 3; // 48000 Hz
-    SrsAudioFrame bad;
-    char bad_bytes[0x2000];
-    memset(bad_bytes, 0x11, sizeof(bad_bytes));
-    HELPER_ASSERT_SUCCESS(bad.initialize(&aac));
-    HELPER_ASSERT_SUCCESS(bad.add_sample(bad_bytes, (int)sizeof(bad_bytes)));
-
-    err = cache.cache_audio(&bad, 5000);
+    err = muxer.flush_audio(&cache);
     ASSERT_TRUE(err != srs_success);
-    EXPECT_EQ(ERROR_HLS_AAC_FRAME_LENGTH, srs_error_code(err));
+    EXPECT_EQ(ERROR_HLS_METADATA, srs_error_code(err));
     srs_freep(err);
 
-    // The cadence still comes from the last accepted packet at DTS 0.
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&mframe, 1000));
-    ASSERT_TRUE(cache.audio != NULL);
-    EXPECT_EQ((int64_t)2000, cache.audio->end_dts);
+    // The rejected message was never taken by the muxer; the cache still owns
+    // it and is responsible for freeing it.
+    EXPECT_TRUE(cache.audio != NULL);
 
-    // An empty packet advances the clock but contributes no media duration.
-    SrsAudioFrame empty;
-    HELPER_ASSERT_SUCCESS(empty.initialize(&mp3));
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&empty, 2000));
-    EXPECT_EQ((int64_t)2000, cache.audio->end_dts);
-
-    // The next real packet is measured from the empty packet's clock.
-    HELPER_ASSERT_SUCCESS(cache.cache_audio(&mframe, 3000));
-    EXPECT_EQ((int64_t)4000, cache.audio->end_dts);
+    muxer.dispose();
 }
 
-// A codec change exactly at the retained boundary can leave the written
-// aggregate without a derivable media end. The muxer must fail explicitly
-// instead of advertising a zero-duration entry or borrowing the video clock.
-TEST(HlsControllerTest, CodecChangeAtRetainedBoundaryWithoutAudioEndFailsExplicitly)
+// A codec change exactly at the retained boundary leaves the current segment's
+// duration unmeasured, but its media is preserved: the segment is reopened
+// with the discovered codec, the MP3 audio is replayed with its original
+// payload and timestamp, and the first HEVC keyframe follows it.
+TEST(HlsControllerTest, CodecChangeAtRetainedBoundaryReplaysRetainedAudio)
 {
     srs_error_t err = srs_success;
 
     std::stringstream dir_ss;
-    dir_ss << _srs_tmp_file_prefix << "issue70-no-audio-end-" << srs_update_system_time();
+    dir_ss << _srs_tmp_file_prefix << "issue70-codec-boundary-" << srs_update_system_time();
     std::string dir = dir_ss.str();
     std::stringstream conf_ss;
     conf_ss << "listen 1935;"
@@ -2289,13 +2336,13 @@ TEST(HlsControllerTest, CodecChangeAtRetainedBoundaryWithoutAudioEndFailsExplici
     SrsRequest req;
     req.vhost = "__defaultVhost__";
     req.app = "live";
-    req.stream = "no-audio-end";
+    req.stream = "codec-boundary";
     HELPER_ASSERT_SUCCESS(controller.on_publish(&req));
 
     SrsAudioCodecConfig acodec;
     acodec.id = SrsAudioCodecIdAAC;
     acodec.aac_object = SrsAacObjectTypeAacLC;
-    acodec.aac_sample_rate = 3; // 48000 Hz
+    acodec.aac_sample_rate = 4; // 44100 Hz
     acodec.aac_channels = 2;
 
     SrsAudioFrame aframe;
@@ -2304,7 +2351,7 @@ TEST(HlsControllerTest, CodecChangeAtRetainedBoundaryWithoutAudioEndFailsExplici
     memset(abytes, 0x55, sizeof(abytes));
     HELPER_ASSERT_SUCCESS(aframe.add_sample(abytes, (int)sizeof(abytes)));
 
-    std::string m3u8 = dir + "/no-audio-end.m3u8";
+    std::string m3u8 = dir + "/codec-boundary.m3u8";
 
     // Write the prelude without reaping. The overflow threshold is the
     // configured hls_aof_ratio * hls_fragment = 500ms.
@@ -2317,9 +2364,9 @@ TEST(HlsControllerTest, CodecChangeAtRetainedBoundaryWithoutAudioEndFailsExplici
     }
     EXPECT_TRUE(srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8)).empty());
 
-    // The overflowing packet switches the audio codec to MP3. The codec change
-    // resets the packet cadence, and this cache has no MP3 frame parser, so the
-    // aggregate flushed into the retained segment has no media end.
+    // The overflowing packet switches the audio codec to MP3 and reaps the
+    // prelude. The MP3 aggregate is flushed into the retained segment with no
+    // measured duration.
     SrsAudioCodecConfig mp3;
     mp3.id = SrsAudioCodecIdMP3;
     mp3.sound_rate = SrsAudioSampleRate44100;
@@ -2328,32 +2375,203 @@ TEST(HlsControllerTest, CodecChangeAtRetainedBoundaryWithoutAudioEndFailsExplici
     memset(mbytes, 0x66, sizeof(mbytes));
     HELPER_ASSERT_SUCCESS(mframe.initialize(&mp3));
     HELPER_ASSERT_SUCCESS(mframe.add_sample(mbytes, (int)sizeof(mbytes)));
-    HELPER_ASSERT_SUCCESS(controller.write_audio(&mframe, dts + 1920));
 
-    // The prelude was advertised; the retained segment now holds the MP3
-    // packet and no measured duration.
+    int64_t retained_start = dts + 1920;
+    HELPER_ASSERT_SUCCESS(controller.write_audio(&mframe, retained_start));
+
     std::vector<std::pair<double, std::string> > entries = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
     ASSERT_EQ(1, (int)entries.size());
+    std::string prelude_uri = entries.at(0).second;
     EXPECT_GT(entries.at(0).first, 0.0);
 
-    std::string retained = controller.ts_url();
-    std::string retained_tmp = dir + "/" + retained + ".tmp";
-    {
-        std::ifstream retained_in(retained_tmp.c_str(), std::ios::binary);
-        EXPECT_TRUE(retained_in.good());
-    }
+    std::string retained_uri = controller.ts_url();
+    EXPECT_TRUE(prelude_uri != retained_uri);
 
-    err = controller.update_video_codec(SrsVideoCodecIdHEVC);
-    ASSERT_TRUE(err != srs_success);
-    EXPECT_EQ(ERROR_HLS_METADATA, srs_error_code(err));
-    srs_freep(err);
+    // The discovery must not fail and must not drop the retained media.
+    HELPER_ASSERT_SUCCESS(controller.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(retained_uri, controller.ts_url());
 
-    // No zero-duration entry was published, and the unadvertised segment was
-    // not replaced by a fabricated duration; the explicit error is the policy.
-    entries = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
-    EXPECT_EQ(1, (int)entries.size());
-    EXPECT_TRUE(!retained.empty() && entries.at(0).second != retained);
+    SrsVideoCodecConfig vcodec;
+    vcodec.id = SrsVideoCodecIdHEVC;
 
+    SrsVideoFrame vframe;
+    HELPER_ASSERT_SUCCESS(vframe.initialize(&vcodec));
+    vframe.frame_type = SrsVideoAvcFrameTypeKeyFrame;
+    vframe.cts = 0;
+    vframe.dts = 0;
+    char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
+    HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
+
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, retained_start));
+    HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, retained_start + 180000));
     HELPER_ASSERT_SUCCESS(controller.on_unpublish());
+
+    entries = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_TRUE(entries.size() >= 2);
+    EXPECT_EQ(prelude_uri, entries.at(0).second);
+    EXPECT_EQ(retained_uri, entries.at(1).second);
+    for (size_t i = 0; i < entries.size(); i++) {
+        EXPECT_TRUE(entries.at(i).first > 0);
+    }
+    EXPECT_TRUE(entries.at(1).first >= 1.0);
+
+    std::string published = srs_ut70_read_file(dir + "/" + retained_uri);
+    ASSERT_TRUE(!published.empty());
+
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_MP3));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    int64_t audio_dts = -1;
+    int audio_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_AUDIO_MP3_PID, &audio_dts);
+    int64_t video_dts = -1;
+    int video_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_VIDEO_PID, &video_dts);
+    ASSERT_GE(audio_offset, 0);
+    ASSERT_GE(video_offset, 0);
+    EXPECT_EQ(retained_start, audio_dts);
+    EXPECT_LT(audio_offset, video_offset);
+    EXPECT_TRUE(srs_ut70_contains_run(published, 0x66, 32));
 }
 
+// Exercise the real SrsHls::on_audio/on_video seam, including its own DTS
+// computation: the first MP3 packet after a cadence reset triggers the audio
+// overflow reap, and the HEVC sequence header discovers the codec in the
+// resulting zero-duration window. The retained MP3 audio and the first HEVC
+// keyframe must both survive into a segment whose first PMT is MP3+HEVC.
+TEST(HlsSeamTest, Mp3CadenceResetBoundaryPreservesAudioAndFirstVideo)
+{
+    srs_error_t err = srs_success;
+
+    std::stringstream dir_ss;
+    dir_ss << _srs_tmp_file_prefix << "issue70-seam-" << srs_update_system_time();
+    std::string dir = dir_ss.str();
+    std::stringstream conf_ss;
+    conf_ss << "listen 1935;"
+            << "vhost __defaultVhost__ {"
+            << "    hls {"
+            << "        enabled on;"
+            << "        hls_path " << dir << ";"
+            << "        hls_fragment 1;"
+            << "        hls_window 60;"
+            << "        hls_dts_directly on;"
+            << "        hls_ts_file [stream]-[seq].ts;"
+            << "        hls_m3u8_file [stream].m3u8;"
+            << "    }"
+            << "}";
+    std::string conf_str = conf_ss.str();
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.parse(conf_str.c_str()));
+    SrsUt70ConfigGuard config_guard(&conf);
+
+    SrsRequest req;
+    req.vhost = "__defaultVhost__";
+    req.app = "live";
+    req.stream = "seam";
+
+    SrsHls hls;
+    HELPER_ASSERT_SUCCESS(hls.initialize(NULL, &req));
+    HELPER_ASSERT_SUCCESS(hls.on_publish());
+
+    SrsFormat format;
+    srs_ut70_initialize_audio_format(&format, SrsAudioCodecIdAAC);
+
+    char abytes[1024];
+    memset(abytes, 0x55, sizeof(abytes));
+
+    std::string m3u8 = dir + "/seam.m3u8";
+
+    // SrsHls::on_audio turns the FLV timestamp into the TS DTS directly
+    // (hls_dts_directly on), so 92 AAC packets at 23ms leave the prelude just
+    // below the 2.1s absolute overflow threshold (2093ms). The next packet is
+    // the first MP3 packet after a cadence reset and triggers the reap.
+    for (int i = 0; i < 92; i++) {
+        srs_ut70_set_audio_frame(&format, SrsAudioAacFrameTraitRawData, abytes, (int)sizeof(abytes));
+        SrsUniquePtr<SrsSharedPtrMessage> msg(srs_ut70_message(true, 23 * i, 8));
+        ASSERT_TRUE(msg.get() != NULL);
+        HELPER_ASSERT_SUCCESS(hls.on_audio(msg.get(), &format));
+        ASSERT_TRUE(srs_ut70_read_file(m3u8).find("#EXTINF") == std::string::npos);
+    }
+
+    // The MP3 packet that reaps the prelude lands in the new segment with no
+    // measured duration (the cadence of the previous codec was reset).
+    format.acodec->id = SrsAudioCodecIdMP3;
+    char mbytes[1024];
+    memset(mbytes, 0x66, sizeof(mbytes));
+    srs_ut70_set_audio_frame(&format, SrsAudioAacFrameTraitRawData, mbytes, (int)sizeof(mbytes));
+
+    SrsUniquePtr<SrsSharedPtrMessage> mp3(srs_ut70_message(true, 23 * 92, 8));
+    ASSERT_TRUE(mp3.get() != NULL);
+    HELPER_ASSERT_SUCCESS(hls.on_audio(mp3.get(), &format));
+
+    std::vector<std::pair<double, std::string> > advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_EQ(1, (int)advertised.size());
+    std::string prelude_uri = advertised.at(0).second;
+    EXPECT_GT(advertised.at(0).first, 0.0);
+
+    // The HEVC sequence header discovers the video codec inside the
+    // zero-duration window. This is the failure point of the estimation
+    // approach: it must preserve the retained audio instead of failing.
+    SrsFormat vformat;
+    srs_ut70_initialize_video_format(&vformat, SrsVideoCodecIdHEVC);
+    vformat.video->frame_type = SrsVideoAvcFrameTypeKeyFrame;
+    vformat.video->avc_packet_type = SrsVideoAvcFrameTraitSequenceHeader;
+
+    SrsUniquePtr<SrsSharedPtrMessage> sh(srs_ut70_message(false, 23 * 92, 8));
+    ASSERT_TRUE(sh.get() != NULL);
+    HELPER_ASSERT_SUCCESS(hls.on_video(sh.get(), &vformat));
+
+    // The first HEVC keyframe follows the replayed audio in the same segment.
+    vformat.video->avc_packet_type = SrsVideoAvcFrameTraitNALU;
+    char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
+    HELPER_ASSERT_SUCCESS(vformat.video->add_sample(vbytes, (int)sizeof(vbytes)));
+
+    SrsUniquePtr<SrsSharedPtrMessage> v1(srs_ut70_message(false, 23 * 92, 16));
+    ASSERT_TRUE(v1.get() != NULL);
+    HELPER_ASSERT_SUCCESS(hls.on_video(v1.get(), &vformat));
+
+    SrsUniquePtr<SrsSharedPtrMessage> v2(srs_ut70_message(false, 23 * 92 + 2000, 16));
+    ASSERT_TRUE(v2.get() != NULL);
+    HELPER_ASSERT_SUCCESS(hls.on_video(v2.get(), &vformat));
+
+    hls.on_unpublish();
+
+    advertised = srs_ut70_m3u8_entries(srs_ut70_read_file(m3u8));
+    ASSERT_TRUE(advertised.size() >= 2);
+    EXPECT_EQ(prelude_uri, advertised.at(0).second);
+    for (size_t i = 0; i < advertised.size(); i++) {
+        EXPECT_TRUE(advertised.at(i).first > 0);
+    }
+    EXPECT_TRUE(advertised.at(1).first >= 1.0);
+
+    std::string prelude = srs_ut70_read_file(dir + "/" + prelude_uri);
+    ASSERT_TRUE(!prelude.empty());
+    std::vector<std::vector<int> > groups = srs_ut70_pmt_stream_types(prelude);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_AAC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+
+    std::string published = srs_ut70_read_file(dir + "/" + advertised.at(1).second);
+    ASSERT_TRUE(!published.empty());
+
+    groups = srs_ut70_pmt_stream_types(published);
+    ASSERT_TRUE(!groups.empty());
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_MP3));
+    EXPECT_TRUE(srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_HEVC));
+    EXPECT_TRUE(!srs_ut70_has_stream_type(groups.at(0), SRS_UT70_STREAM_TYPE_H264));
+
+    // The audio keeps the timestamp assigned by SrsHls::on_audio to the MP3
+    // reap packet: the FLV timestamp 23 * 92ms in the 90kHz TS timescale.
+    int64_t expected_audio_dts = (int64_t)23 * 92 * 90;
+    int64_t audio_dts = -1;
+    int audio_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_AUDIO_MP3_PID, &audio_dts);
+    int64_t video_dts = -1;
+    int video_offset = srs_ut70_first_pes_dts(published, SRS_UT70_TS_VIDEO_PID, &video_dts);
+    ASSERT_GE(audio_offset, 0);
+    ASSERT_GE(video_offset, 0);
+    EXPECT_EQ(expected_audio_dts, audio_dts);
+    EXPECT_LT(audio_offset, video_offset);
+    EXPECT_TRUE(srs_ut70_contains_run(published, 0x66, 32));
+}

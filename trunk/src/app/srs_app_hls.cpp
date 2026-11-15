@@ -40,6 +40,14 @@ using namespace std;
 // TODO: FIXME: Refine to time unit.
 #define SRS_HLS_SEGMENT_MIN_DURATION (100 * SRS_UTIME_MILLISECONDS)
 
+// The bounded replay cache for the audio of the current unadvertised segment.
+// A normal segment holds one audio window before it is reaped, so this budget
+// covers that window even at high audio bitrates. A source that keeps sending
+// audio without advancing its timing cannot be replayed as a valid segment;
+// exceeding the budget fails explicitly instead of growing memory without
+// bound or dropping the retained media silently.
+#define SRS_HLS_RETAINED_AUDIO_MAX_BYTES (4 * 1024 * 1024)
+
 // fragment plus the deviation percent.
 #define SRS_HLS_FLOOR_REAP_PERCENT 0.3
 // reset the piece id when deviation overflow this.
@@ -207,7 +215,7 @@ SrsHlsMuxer::SrsHlsMuxer()
     current_written_ = false;
     video_established_ = false;
     segment_advertised_ = false;
-    audio_end_dts_ = 0;
+    retained_audio_bytes_ = 0;
 
     memset(key, 0, 16);
     memset(iv, 0, 16);
@@ -215,6 +223,8 @@ SrsHlsMuxer::SrsHlsMuxer()
 
 SrsHlsMuxer::~SrsHlsMuxer()
 {
+    clear_retained_audio();
+
     srs_freep(segments);
     srs_freep(current);
     srs_freep(req);
@@ -236,6 +246,8 @@ void SrsHlsMuxer::dispose()
         }
         srs_freep(current);
     }
+
+    clear_retained_audio();
     
     if (unlink(m3u8.c_str()) < 0) {
         srs_warn("dispose unlink path failed. file=%s", m3u8.c_str());
@@ -329,33 +341,38 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
 
     // An audio-only prelude has already advertised segments, so the current
     // segment holds only unadvertised audio. That segment cannot start with
-    // the newly discovered codec, but its media must be kept: finalize it as
-    // audio-only media, then open the next segment with the real codec before
-    // the first video packet, so no advertised video segment starts with the
-    // provisional program map.
+    // the newly discovered codec, but its media must be kept.
     if (segment_advertised_) {
-        // The overflow reap may have flushed a single audio aggregate into this
-        // segment, recording only its start DTS. Its measured duration is zero
-        // until another audio packet arrives or until we measure the media
-        // actually written. Use the media end of the audio aggregates in this
-        // segment; the first video timestamp is a different clock and cannot
-        // define the audio duration.
+        // The overflow reap may have flushed an audio aggregate into this
+        // segment, recording only its start DTS, so the measured duration is
+        // still zero. Reopen the unadvertised segment with the real codec,
+        // replay the audio already written into it with its original payload
+        // and timestamps, and let the first video keyframe follow. This keeps
+        // the media without advertising a zero-duration entry and without
+        // borrowing the first video timestamp.
         if (current->duration() == 0) {
-            if (audio_end_dts_ <= 0) {
+            if (retained_audio_.empty()) {
                 return srs_error_new(ERROR_HLS_METADATA,
-                    "hls: no audio media end for the retained segment, end=%" PRId64, audio_end_dts_);
+                    "hls: no retained audio for the zero-duration segment");
             }
 
-            update_duration(audio_end_dts_);
+            srs_trace("hls: reopen zero-duration segment for video codec %d(%s), audio=%dmsgs",
+                vcodec, srs_video_codec_id2str(vcodec).c_str(), (int)retained_audio_.size());
+
+            if ((err = reopen_segment(vcodec)) != srs_success) {
+                return srs_error_wrap(err, "hls: reopen zero-duration segment");
+            }
+
+            if ((err = replay_retained_audio()) != srs_success) {
+                return srs_error_wrap(err, "hls: replay retained audio");
+            }
+
+            return err;
         }
 
-        // Never publish a retained segment with a nonpositive duration, even
-        // if the audio end truncates to the segment start millisecond.
-        if (current->duration() == 0) {
-            return srs_error_new(ERROR_HLS_METADATA,
-                "hls: retained segment has no positive audio duration, end=%" PRId64, audio_end_dts_);
-        }
-
+        // The segment's timing is already measured, so it can be finalized as
+        // its own positive-duration audio-only entry and the video codec starts
+        // in the next segment.
         srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
             vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current->duration()));
 
@@ -374,13 +391,16 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
 
     // Audio may have already flushed a provisional PMT with the default codec.
     // Restart the startup segment so the advertised one contains the real
-    // codec from its first packet.
+    // codec from its first packet. This segment was never advertised and its
+    // audio is deliberately discarded by the reopen.
     srs_trace("hls: reopen provisional segment for video codec %d(%s)",
         vcodec, srs_video_codec_id2str(vcodec).c_str());
 
     if ((err = reopen_segment(vcodec)) != srs_success) {
         return srs_error_wrap(err, "hls: reopen provisional segment");
     }
+
+    clear_retained_audio();
 
     return err;
 }
@@ -422,6 +442,9 @@ srs_error_t SrsHlsMuxer::on_publish(SrsRequest* req)
 
     video_established_ = false;
     segment_advertised_ = false;
+
+    // A new publication never inherits the retained media of a previous one.
+    clear_retained_audio();
 
     if ((err = async->start()) != srs_success) {
         return srs_error_wrap(err, "async start");
@@ -630,7 +653,6 @@ srs_error_t SrsHlsMuxer::segment_open()
     // reset the context for a new ts start.
     context->reset();
     current_written_ = false;
-    audio_end_dts_ = 0;
 
     return err;
 }
@@ -706,15 +728,36 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache* cache)
     // update the duration of segment.
     update_duration(cache->audio->dts);
 
+    // Audio written after an advertised prelude and before the first video of
+    // the session belongs to an unadvertised segment. Retain it so the segment
+    // can be reopened with the discovered video codec and replayed with its
+    // original payload and timestamps. Bound the retained payload: a source
+    // that writes more audio than such a segment can carry while its timing
+    // cannot be measured is invalid input and fails explicitly, instead of
+    // growing memory without bound or discarding the retained media silently.
+    bool retain = segment_advertised_ && !video_established_;
+    if (retain && retained_audio_bytes_ + (int64_t)cache->audio->payload->length() > SRS_HLS_RETAINED_AUDIO_MAX_BYTES) {
+        return srs_error_new(ERROR_HLS_METADATA,
+            "hls: retained audio exceeds the bounded replay cache, bytes=%" PRId64 ", limit=%d",
+            retained_audio_bytes_, SRS_HLS_RETAINED_AUDIO_MAX_BYTES);
+    }
+
     if ((err = current->tscw->write_audio(cache->audio)) != srs_success) {
         return srs_error_wrap(err, "hls: write audio");
     }
     current_written_ = true;
 
-    // Only an aggregate that reached the segment may measure its audio media.
-    // A failed write returns above, so it cannot mark payload as written.
-    if (cache->audio->end_dts > 0) {
-        audio_end_dts_ = srs_max(audio_end_dts_, cache->audio->end_dts);
+    // The message was serialized successfully. Transfer its ownership to the
+    // replay cache instead of freeing it, so the exact payload and timestamps
+    // can be written again into the reopened segment.
+    if (retain) {
+        RetainedAudio audio;
+        audio.msg = cache->audio;
+        audio.acodec = current->tscw->acodec();
+        retained_audio_.push_back(audio);
+        retained_audio_bytes_ += cache->audio->payload->length();
+        cache->audio = NULL;
+        return err;
     }
 
     // write success, clear and free the msg
@@ -748,6 +791,10 @@ srs_error_t SrsHlsMuxer::flush_video(SrsTsMessageCache* cache)
     current_written_ = true;
     video_established_ = true;
 
+    // The segment is now established with the real codec and written video;
+    // its retained audio no longer needs a replay cache.
+    clear_retained_audio();
+
     // write success, clear and free the msg
     srs_freep(cache->video);
     
@@ -759,6 +806,49 @@ void SrsHlsMuxer::update_duration(uint64_t dts)
     current->append(dts / 90);
 }
 
+void SrsHlsMuxer::clear_retained_audio()
+{
+    for (size_t i = 0; i < retained_audio_.size(); i++) {
+        srs_freep(retained_audio_[i].msg);
+    }
+    retained_audio_.clear();
+    retained_audio_bytes_ = 0;
+}
+
+srs_error_t SrsHlsMuxer::replay_retained_audio()
+{
+    srs_error_t err = srs_success;
+
+    srs_assert(current);
+
+    SrsAudioCodecId segment_acodec = current->tscw->acodec();
+
+    // Replay through the reopened segment so its first PMT already advertises
+    // the discovered video codec, and keep the audio codec used when each
+    // message was first written in case it changed inside the window.
+    for (size_t i = 0; i < retained_audio_.size(); i++) {
+        RetainedAudio& audio = retained_audio_[i];
+
+        current->tscw->set_acodec(audio.acodec);
+
+        if ((err = current->tscw->write_audio(audio.msg)) != srs_success) {
+            return srs_error_wrap(err, "hls: replay retained audio");
+        }
+
+        update_duration(audio.msg->dts);
+    }
+
+    // The reopened segment continues with its configured audio codec. It was
+    // captured before the per-message codecs were restored and is the codec
+    // the stream had when the segment was reopened.
+    current->tscw->set_acodec(segment_acodec);
+    current_written_ = true;
+
+    clear_retained_audio();
+
+    return err;
+}
+
 srs_error_t SrsHlsMuxer::segment_close()
 {
     return segment_close(false);
@@ -768,8 +858,9 @@ srs_error_t SrsHlsMuxer::segment_close(bool keep_short)
 {
     srs_error_t err = do_segment_close(keep_short);
 
-    // We always cleanup current segment.
+    // We always cleanup current segment, including its replay cache.
     srs_freep(current);
+    clear_retained_audio();
 
     return err;
 }
@@ -1097,10 +1188,6 @@ srs_error_t SrsHlsController::on_publish(SrsRequest* req)
         return srs_error_wrap(err, "hls: update config");
     }
 
-    // A new publication must not inherit the audio packet cadence of the
-    // previous one.
-    tsmc->reset_audio_timing();
-    
     if ((err = muxer->segment_open()) != srs_success) {
         return srs_error_wrap(err, "hls: segment open");
     }
@@ -1143,10 +1230,6 @@ srs_error_t SrsHlsController::on_sequence_header()
     // ffmpeg ingest a external rtmp stream and push to srs,
     // when the sequence header changed, the stream is not republish.
 
-    // A sequence header may carry a new AAC configuration; the packet cadence
-    // of the previous one must not measure the first packet of the new one.
-    tsmc->reset_audio_timing();
-
     return muxer->on_sequence_header();
 }
 
@@ -1164,10 +1247,6 @@ srs_error_t SrsHlsController::write_audio(SrsAudioFrame* frame, int64_t pts)
         srs_trace("HLS: Switch audio codec %d(%s) to %d(%s)", muxer->latest_acodec(), srs_audio_codec_id2str(muxer->latest_acodec()).c_str(),
             frame->acodec()->id, srs_audio_codec_id2str(frame->acodec()->id).c_str());
         muxer->set_latest_acodec(frame->acodec()->id);
-
-        // The cadence belongs to the previous audio codec and cannot measure
-        // the first packet of the new one.
-        tsmc->reset_audio_timing();
     }
     
     // write audio to cache.

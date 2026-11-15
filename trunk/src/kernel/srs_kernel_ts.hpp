@@ -239,11 +239,6 @@ public:
     // The timestamp in 90khz
     int64_t dts;
     int64_t pts;
-    // The media end DTS in 90khz of the cached message. For an audio message,
-    // which may aggregate multiple packets, this is the end of the last
-    // packet, so the HLS muxer can measure the media duration actually written
-    // instead of only the message start. Zero when the timing is unavailable.
-    int64_t end_dts;
     // The id of pes stream to indicates the payload codec.
     // @remark use is_audio() and is_video() to check it, and stream_number() to finger it out.
     SrsTsPESStreamId sid;
@@ -1314,27 +1309,15 @@ public:
     // The current ts message.
     SrsTsMessage* audio;
     SrsTsMessage* video;
-private:
-    // The DTS of the last successfully cached audio packet, in the same audio
-    // clock as the packets. It validates the cadence of the next packet when
-    // the codec does not expose its frame duration. -1 before any packet.
-    int64_t audio_last_dts_;
 public:
     SrsTsMessageCache();
     virtual ~SrsTsMessageCache();
 public:
-    // Reset the audio timing history. Called on publish, audio codec change and
-    // any other discontinuity, so a stale packet cadence is never inherited.
-    virtual void reset_audio_timing();
     // Write audio to cache
     virtual srs_error_t cache_audio(SrsAudioFrame* frame, int64_t dts);
     // Write video to muxer.
     virtual srs_error_t cache_video(SrsVideoFrame* frame, int64_t dts);
 private:
-    // Get the media duration in 90khz ticks of an audio packet at dts, from
-    // the supported AAC frame metadata or the validated packet cadence. Zero
-    // when the packet timing cannot be derived.
-    virtual int64_t audio_packet_duration(SrsAudioFrame* frame, int64_t dts);
     virtual srs_error_t do_cache_mp3(SrsAudioFrame* frame);
     virtual srs_error_t do_cache_aac(SrsAudioFrame* frame);
     virtual srs_error_t do_cache_avc(SrsVideoFrame* frame);
