@@ -207,6 +207,7 @@ SrsHlsMuxer::SrsHlsMuxer()
     current_written_ = false;
     video_established_ = false;
     segment_advertised_ = false;
+    audio_end_dts_ = 0;
 
     memset(key, 0, 16);
     memset(iv, 0, 16);
@@ -304,7 +305,7 @@ void SrsHlsMuxer::set_latest_vcodec(SrsVideoCodecId v)
     latest_vcodec_ = v;
 }
 
-srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec, int64_t dts)
+srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
 {
     srs_error_t err = srs_success;
 
@@ -333,20 +334,26 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec, int64_t dts)
     // the first video packet, so no advertised video segment starts with the
     // provisional program map.
     if (segment_advertised_) {
-        // The overflow reap may have flushed a single audio frame into this
+        // The overflow reap may have flushed a single audio aggregate into this
         // segment, recording only its start DTS. Its measured duration is zero
-        // until another audio frame arrives. A sequence header alone has no
-        // timestamp, so wait for write_video to pass the first video DTS as
-        // the segment boundary instead of advertising an EXTINF of zero. The
-        // writer keeps the provisional codec until this decision, so the first
-        // video frame reaches this branch and is never written into the
-        // provisional segment.
+        // until another audio packet arrives or until we measure the media
+        // actually written. Use the media end of the audio aggregates in this
+        // segment; the first video timestamp is a different clock and cannot
+        // define the audio duration.
         if (current->duration() == 0) {
-            if (dts < 0) {
-                return err;
+            if (audio_end_dts_ <= 0) {
+                return srs_error_new(ERROR_HLS_METADATA,
+                    "hls: no audio media end for the retained segment, end=%" PRId64, audio_end_dts_);
             }
 
-            update_duration(dts);
+            update_duration(audio_end_dts_);
+        }
+
+        // Never publish a retained segment with a nonpositive duration, even
+        // if the audio end truncates to the segment start millisecond.
+        if (current->duration() == 0) {
+            return srs_error_new(ERROR_HLS_METADATA,
+                "hls: retained segment has no positive audio duration, end=%" PRId64, audio_end_dts_);
         }
 
         srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
@@ -623,6 +630,7 @@ srs_error_t SrsHlsMuxer::segment_open()
     // reset the context for a new ts start.
     context->reset();
     current_written_ = false;
+    audio_end_dts_ = 0;
 
     return err;
 }
@@ -702,6 +710,12 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache* cache)
         return srs_error_wrap(err, "hls: write audio");
     }
     current_written_ = true;
+
+    // Only an aggregate that reached the segment may measure its audio media.
+    // A failed write returns above, so it cannot mark payload as written.
+    if (cache->audio->end_dts > 0) {
+        audio_end_dts_ = srs_max(audio_end_dts_, cache->audio->end_dts);
+    }
 
     // write success, clear and free the msg
     srs_freep(cache->audio);
@@ -1082,6 +1096,10 @@ srs_error_t SrsHlsController::on_publish(SrsRequest* req)
         hls_key_file, hls_key_file_path, hls_key_url)) != srs_success ) {
         return srs_error_wrap(err, "hls: update config");
     }
+
+    // A new publication must not inherit the audio packet cadence of the
+    // previous one.
+    tsmc->reset_audio_timing();
     
     if ((err = muxer->segment_open()) != srs_success) {
         return srs_error_wrap(err, "hls: segment open");
@@ -1124,12 +1142,17 @@ srs_error_t SrsHlsController::on_sequence_header()
     // sequence header may change, for example,
     // ffmpeg ingest a external rtmp stream and push to srs,
     // when the sequence header changed, the stream is not republish.
+
+    // A sequence header may carry a new AAC configuration; the packet cadence
+    // of the previous one must not measure the first packet of the new one.
+    tsmc->reset_audio_timing();
+
     return muxer->on_sequence_header();
 }
 
-srs_error_t SrsHlsController::update_video_codec(SrsVideoCodecId vcodec, int64_t dts)
+srs_error_t SrsHlsController::update_video_codec(SrsVideoCodecId vcodec)
 {
-    return muxer->update_video_codec(vcodec, dts);
+    return muxer->update_video_codec(vcodec);
 }
 
 srs_error_t SrsHlsController::write_audio(SrsAudioFrame* frame, int64_t pts)
@@ -1141,6 +1164,10 @@ srs_error_t SrsHlsController::write_audio(SrsAudioFrame* frame, int64_t pts)
         srs_trace("HLS: Switch audio codec %d(%s) to %d(%s)", muxer->latest_acodec(), srs_audio_codec_id2str(muxer->latest_acodec()).c_str(),
             frame->acodec()->id, srs_audio_codec_id2str(frame->acodec()->id).c_str());
         muxer->set_latest_acodec(frame->acodec()->id);
+
+        // The cadence belongs to the previous audio codec and cannot measure
+        // the first packet of the new one.
+        tsmc->reset_audio_timing();
     }
     
     // write audio to cache.
@@ -1191,7 +1218,7 @@ srs_error_t SrsHlsController::write_video(SrsVideoFrame* frame, int64_t dts)
     if (muxer->latest_vcodec() != frame->vcodec()->id) {
         srs_trace("HLS: Switch video codec %d(%s) to %d(%s)", muxer->latest_vcodec(), srs_video_codec_id2str(muxer->latest_vcodec()).c_str(),
                   frame->vcodec()->id, srs_video_codec_id2str(frame->vcodec()->id).c_str());
-        if ((err = muxer->update_video_codec(frame->vcodec()->id, dts)) != srs_success) {
+        if ((err = muxer->update_video_codec(frame->vcodec()->id)) != srs_success) {
             return srs_error_wrap(err, "hls: update video codec");
         }
     }
