@@ -176,12 +176,23 @@ private:
     // first video frame, so from then on the current segment holds established
     // media and must never be discarded for a provisional codec correction.
     bool segment_advertised_;
-    // The audio written into the current segment after an advertised prelude
-    // and before the first video of the session. Each entry owns a message
-    // that was already serialized to the segment; it is kept alive so the
-    // segment can be reopened with the discovered video codec and replayed
-    // with its original payload and timestamps. The list is empty while the
-    // segment is advertised or video-established.
+    // Whether the current segment's duration has ever been measured positive.
+    // Until then the segment may hold only an aggregate whose start DTS cannot
+    // measure its media, so the audio replay cache can reconstruct it. Once the
+    // timing is measured the regular close/open path finalizes the segment;
+    // retention stops, and a later timestamp regression never reopens the
+    // cache over an incomplete segment.
+    bool segment_timing_measured_;
+    // The audio written into the current unadvertised segment while its
+    // measured duration is still zero, after an advertised prelude and before
+    // the first video of the session. Each entry owns a message that was
+    // already serialized to the segment; it is kept alive so the segment can
+    // be reopened with the discovered video codec and replayed with its
+    // original payload and timestamps, including when a further codec is
+    // discovered before the first media frame. The cache is released when a
+    // later message measures a positive duration (the close/open path then
+    // finalizes the segment), when video is written, when the segment is
+    // finalized, and on republish or disposal.
     struct RetainedAudio {
         // The written message, owned by this cache until replayed or freed.
         SrsTsMessage* msg;
@@ -200,8 +211,9 @@ private:
     // Free the retained audio replay cache of the current segment.
     void clear_retained_audio();
     // Replay the retained audio into the current reopened segment, preserving
-    // its payload and timestamps and marking the segment as written again.
-    // Ownership of the replayed messages ends here.
+    // its payload and timestamps and marking the segment as written again. The
+    // cache keeps ownership so another discovery can replay it after a new
+    // reopen; it is released when the segment is established or finalized.
     srs_error_t replay_retained_audio();
 public:
     virtual int sequence_no();
@@ -217,13 +229,14 @@ public:
     // PMT is emitted. An unwritten segment adopts it directly. A provisional
     // startup segment that already wrote a different program map is rotated so
     // no advertised segment mixes provisional and real codecs. If an earlier
-    // audio-only segment has been advertised, the current audio-only segment is
-    // kept with the real codec: a zero-duration segment is reopened and its
-    // retained audio replayed before the first video keyframe, while a segment
-    // with measured positive duration is finalized as its own media. The
-    // retained media is never discarded and no zero-duration entry is
-    // advertised. Once video media has been written the segment is established
-    // and kept.
+    // audio-only segment has been advertised, the current segment is kept with
+    // the real codec: while its measured duration is still zero it is reopened
+    // and its retained audio replayed before the first video keyframe, even if
+    // a further codec is discovered before that keyframe; a segment with
+    // measured positive duration is finalized as its own media. The retained
+    // media is never discarded and no zero-duration entry is advertised for an
+    // unmeasured segment. Once video media has been written the segment is
+    // established and kept.
     virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
 public:
     // Initialize the hls muxer.

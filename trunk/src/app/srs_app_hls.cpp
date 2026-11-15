@@ -215,6 +215,7 @@ SrsHlsMuxer::SrsHlsMuxer()
     current_written_ = false;
     video_established_ = false;
     segment_advertised_ = false;
+    segment_timing_measured_ = false;
     retained_audio_bytes_ = 0;
 
     memset(key, 0, 16);
@@ -350,12 +351,13 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
         // and timestamps, and let the first video keyframe follow. This keeps
         // the media without advertising a zero-duration entry and without
         // borrowing the first video timestamp.
-        if (current->duration() == 0) {
-            if (retained_audio_.empty()) {
-                return srs_error_new(ERROR_HLS_METADATA,
-                    "hls: no retained audio for the zero-duration segment");
-            }
-
+        //
+        // The cache stays owned until the first video establishes the segment
+        // or the segment is finalized, so a further codec discovery before the
+        // first media frame can reopen and replay it again; the reopened
+        // segment discards the previous temporary file, so nothing is
+        // duplicated.
+        if (current->duration() == 0 && !segment_timing_measured_ && !retained_audio_.empty()) {
             srs_trace("hls: reopen zero-duration segment for video codec %d(%s), audio=%dmsgs",
                 vcodec, srs_video_codec_id2str(vcodec).c_str(), (int)retained_audio_.size());
 
@@ -370,9 +372,15 @@ srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
             return err;
         }
 
-        // The segment's timing is already measured, so it can be finalized as
-        // its own positive-duration audio-only entry and the video codec starts
-        // in the next segment.
+        // Either the segment's timing is already measured, or it was measured
+        // and a later timestamp regression returned the fragment duration to
+        // zero after the replay cache had been released. Reopening now would
+        // discard the written audio, and the replay cache no longer covers the
+        // whole segment, so never use it here. Finalize the segment as its own
+        // audio-only entry through the existing close/open path and start the
+        // video codec in the next segment. A regressed timestamp is invalid
+        // input: its media is preserved, and the entry carries whatever
+        // duration the fragment measured, without fabricating one.
         srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
             vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current->duration()));
 
@@ -442,6 +450,7 @@ srs_error_t SrsHlsMuxer::on_publish(SrsRequest* req)
 
     video_established_ = false;
     segment_advertised_ = false;
+    segment_timing_measured_ = false;
 
     // A new publication never inherits the retained media of a previous one.
     clear_retained_audio();
@@ -653,6 +662,7 @@ srs_error_t SrsHlsMuxer::segment_open()
     // reset the context for a new ts start.
     context->reset();
     current_written_ = false;
+    segment_timing_measured_ = false;
 
     return err;
 }
@@ -731,11 +741,22 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache* cache)
     // Audio written after an advertised prelude and before the first video of
     // the session belongs to an unadvertised segment. Retain it so the segment
     // can be reopened with the discovered video codec and replayed with its
-    // original payload and timestamps. Bound the retained payload: a source
-    // that writes more audio than such a segment can carry while its timing
-    // cannot be measured is invalid input and fails explicitly, instead of
-    // growing memory without bound or discarding the retained media silently.
-    bool retain = segment_advertised_ && !video_established_;
+    // original payload and timestamps.
+    //
+    // Only a segment whose timing is still unmeasured needs that replay: the
+    // overflow reap may have written an aggregate that records only its start
+    // DTS. Once a later message gives the segment a positive measured
+    // duration, the existing close/open path can finalize it as its own
+    // audio-only entry, so retention stops and the cache is released. This
+    // keeps normal advancing audio out of the replay budget. Bound the
+    // retained payload while the timing cannot be measured: a source that
+    // keeps writing audio without advancing its clock is invalid input and
+    // fails explicitly, instead of growing memory without bound or discarding
+    // the retained media silently.
+    bool retain = segment_advertised_ && !video_established_ && !segment_timing_measured_;
+    if (!retain) {
+        clear_retained_audio();
+    }
     if (retain && retained_audio_bytes_ + (int64_t)cache->audio->payload->length() > SRS_HLS_RETAINED_AUDIO_MAX_BYTES) {
         return srs_error_new(ERROR_HLS_METADATA,
             "hls: retained audio exceeds the bounded replay cache, bytes=%" PRId64 ", limit=%d",
@@ -804,6 +825,14 @@ srs_error_t SrsHlsMuxer::flush_video(SrsTsMessageCache* cache)
 void SrsHlsMuxer::update_duration(uint64_t dts)
 {
     current->append(dts / 90);
+
+    // Remember that this segment has a measured positive duration. From then
+    // on the existing close/open path finalizes it; the audio replay cache is
+    // not needed and stops covering the segment even if a later timestamp
+    // regression returns the fragment duration to zero.
+    if (current->duration() > 0) {
+        segment_timing_measured_ = true;
+    }
 }
 
 void SrsHlsMuxer::clear_retained_audio()
@@ -844,8 +873,11 @@ srs_error_t SrsHlsMuxer::replay_retained_audio()
     current->tscw->set_acodec(segment_acodec);
     current_written_ = true;
 
-    clear_retained_audio();
-
+    // Keep ownership of the replayed messages: another codec may be discovered
+    // before the first video frame, and it would reopen this segment and need
+    // the same audio again. The cache is released when the first video
+    // establishes the segment, when the segment is finalized, or on republish
+    // and disposal.
     return err;
 }
 
