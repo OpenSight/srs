@@ -21,6 +21,7 @@ using namespace std;
 #include <srs_utest_config.hpp>
 
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -828,6 +829,11 @@ public:
 
 static std::string srs_ut70_read_file(const std::string& path)
 {
+    // These tests snapshot the current segment's .tmp file while its buffered
+    // writer is still open, so flush pending stdio output before the independent
+    // read. Do not rely on the platform's buffer size to make the write visible.
+    std::fflush(NULL);
+
     std::ifstream in(path.c_str(), std::ios::binary);
     std::ostringstream ss;
     ss << in.rdbuf();
@@ -2834,13 +2840,15 @@ static void srs_ut70_run_repeated_discovery(const std::string& name, SrsVideoCod
     vframe.frame_type = SrsVideoAvcFrameTypeKeyFrame;
     vframe.cts = 0;
     vframe.dts = 0;
+    // SrsFrame::add_sample stores this buffer without copying it, so keep it
+    // alive through both write_video calls below.
+    char vbytes[4] = {0};
     if (second == SrsVideoCodecIdAVC) {
-        char vbytes[4] = {0x65, (char)0x88, (char)0x84, 0x00};
-        HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
+        vbytes[0] = 0x65; vbytes[1] = (char)0x88; vbytes[2] = (char)0x84; vbytes[3] = 0x00;
     } else {
-        char vbytes[4] = {0x02, 0x01, (char)0xe0, 0x44};
-        HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
+        vbytes[0] = 0x02; vbytes[1] = 0x01; vbytes[2] = (char)0xe0; vbytes[3] = 0x44;
     }
+    HELPER_ASSERT_SUCCESS(vframe.add_sample(vbytes, (int)sizeof(vbytes)));
 
     HELPER_ASSERT_SUCCESS(controller.write_video(&vframe, r.retained_start));
     ASSERT_EQ(r.retained_uri, controller.ts_url());
