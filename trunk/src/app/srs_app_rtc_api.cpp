@@ -749,6 +749,14 @@ srs_error_t SrsGoApiRtcWhip::do_serve_http(ISrsHttpResponseWriter* w, ISrsHttpMe
     ruc->req_->app = app.empty() ? "live" : app;
     ruc->req_->stream = stream.empty() ? "livestream" : stream;
     ruc->req_->param = r->query();
+    // The HTTP parser strips the question mark from the request query, while
+    // SrsRequest::param keeps it for RTMP, HTTP-FLV and the legacy WebRTC
+    // publish API. HTTP callbacks such as the appliance srsproxy only parse
+    // user arguments when param starts with '?', so keep the WHIP publishing
+    // query in the same wire format. Playback is left unchanged.
+    if (action == "publish" && !ruc->req_->param.empty() && ruc->req_->param.at(0) != '?') {
+        ruc->req_->param = "?" + ruc->req_->param;
+    }
 
     ruc->req_->ice_ufrag_ = r->query_get("ice-ufrag");
     ruc->req_->ice_pwd_ = r->query_get("ice-pwd");
