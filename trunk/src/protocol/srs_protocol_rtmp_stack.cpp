@@ -1466,6 +1466,7 @@ SrsChunkStream::~SrsChunkStream()
 
 ISrsRequest::ISrsRequest()
 {
+    bitrate_ = 0;
 }
 
 ISrsRequest::~ISrsRequest()
@@ -1513,6 +1514,7 @@ ISrsRequest *SrsRequest::copy()
     }
 
     cp->protocol_ = protocol_;
+    cp->bitrate_ = bitrate_;
 
     return cp;
 }
@@ -1542,6 +1544,7 @@ void SrsRequest::update_auth(ISrsRequest *req)
     }
 
     protocol_ = req->protocol_;
+    bitrate_ = req->bitrate_;
 
     srs_info("update req of soruce for auth ok");
 }

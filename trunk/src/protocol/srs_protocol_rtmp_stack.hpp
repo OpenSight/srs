@@ -468,6 +468,9 @@ public:
     // used for edge traverse to origin authentication,
     // @see https://github.com/ossrs/srs/issues/104
     SrsAmf0Object *args_;
+    // [OpenSight fork] The WebRTC publishing REMB target in bps requested by the legacy publish
+    // API, where 0 means no per-request target and the per-vhost default applies.
+    uint64_t bitrate_;
 
 public:
     // The protocol of client:

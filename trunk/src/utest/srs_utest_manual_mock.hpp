@@ -333,6 +333,7 @@ public:
     bool rtc_server_enabled_;
     bool rtc_enabled_;
     bool rtc_init_rate_from_sdp_;
+    uint64_t rtc_bitrate_;
     bool asprocess_;
     std::string srt_default_mode_;
 
@@ -366,6 +367,7 @@ public:
         rtc_server_enabled_ = false;
         rtc_enabled_ = false;
         rtc_init_rate_from_sdp_ = false;
+        rtc_bitrate_ = 0;
         asprocess_ = false;
         srt_default_mode_ = "request";
     }
@@ -542,6 +544,7 @@ public:
     virtual int get_mw_msgs(std::string vhost, bool is_realtime, bool is_rtc) { return mw_msgs_; }
     virtual int get_rtc_drop_for_pt(std::string vhost) { return rtc_drop_for_pt_; }
     virtual bool get_rtc_twcc_enabled(std::string vhost) { return rtc_twcc_enabled_; }
+    virtual uint64_t get_rtc_bitrate(std::string vhost) { return rtc_bitrate_; }
     virtual bool get_rtc_init_rate_from_sdp(std::string vhost) { return rtc_init_rate_from_sdp_; }
     virtual bool get_rtc_keep_original_ssrc(std::string vhost) { return false; }
     virtual bool get_srt_enabled() { return srt_enabled_; }
@@ -700,6 +703,7 @@ public:
     void set_rtc_nack_no_copy(bool no_copy) { rtc_nack_no_copy_ = no_copy; }
     void set_rtc_drop_for_pt(int pt) { rtc_drop_for_pt_ = pt; }
     void set_rtc_twcc_enabled(bool enabled) { rtc_twcc_enabled_ = enabled; }
+    void set_rtc_bitrate(uint64_t bitrate) { rtc_bitrate_ = bitrate; }
     void set_srt_enabled(bool enabled) { srt_enabled_ = enabled; }
     void set_rtc_to_rtmp(bool enabled) { rtc_to_rtmp_ = enabled; }
     void set_api_as_candidates(bool enabled) { api_as_candidates_ = enabled; }
@@ -722,6 +726,8 @@ public:
     int send_rtcp_count_;
     int send_rtcp_fb_pli_count_;
     int check_send_nacks_count_;
+    // [OpenSight fork] The RTCP packets sent by the publish stream, in send order.
+    std::vector<std::string> sent_rtcp_packets_;
 
 public:
     MockRtcPacketReceiver();

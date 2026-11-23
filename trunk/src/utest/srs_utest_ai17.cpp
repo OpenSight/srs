@@ -2900,6 +2900,84 @@ VOID TEST(SrsGoApiRtcPublishTest, ServeHttpSuccess)
     EXPECT_TRUE(response.find("\"code\":") != std::string::npos);
 }
 
+// The legacy /rtc/v1/publish/ request contract: a valid nonzero JSON bitrate wins over the
+// query bitrate, which wins over the vhost default applied later by the publisher. Zero and
+// invalid values fall back, and positive values below the floor are clamped.
+VOID TEST(SrsGoApiRtcPublishTest, ResolveLegacyRequestBitrate)
+{
+    // No per-request target.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), ""));
+    }
+
+    // A valid nonzero JSON target wins over a valid query target.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        req->set("bitrate", SrsJsonAny::integer(1000000));
+        EXPECT_EQ(1000000, srs_rtc_publish_resolve_bitrate(req.get(), "2000000"));
+    }
+
+    // The query target is used when the JSON target is omitted or explicitly zero.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        EXPECT_EQ(2000000, srs_rtc_publish_resolve_bitrate(req.get(), "2000000"));
+
+        req->set("bitrate", SrsJsonAny::integer(0));
+        EXPECT_EQ(2000000, srs_rtc_publish_resolve_bitrate(req.get(), "2000000"));
+    }
+
+    // A non-integer JSON value is malformed and falls back to the query target.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        req->set("bitrate", SrsJsonAny::str("1000000"));
+        EXPECT_EQ(2000000, srs_rtc_publish_resolve_bitrate(req.get(), "2000000"));
+    }
+
+    // Positive request values below the established floor clamp to 64000 bps.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        req->set("bitrate", SrsJsonAny::integer(32000));
+        EXPECT_EQ(64000, srs_rtc_publish_resolve_bitrate(req.get(), ""));
+
+        SrsUniquePtr<SrsJsonObject> query_only(SrsJsonAny::object());
+        EXPECT_EQ(64000, srs_rtc_publish_resolve_bitrate(query_only.get(), "32000"));
+    }
+
+    // The boundaries are inclusive.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        req->set("bitrate", SrsJsonAny::integer(64000));
+        EXPECT_EQ(64000, srs_rtc_publish_resolve_bitrate(req.get(), ""));
+
+        req->set("bitrate", SrsJsonAny::integer(104857600));
+        EXPECT_EQ(104857600, srs_rtc_publish_resolve_bitrate(req.get(), ""));
+    }
+
+    // Above the top boundary or negative is malformed and falls back to the query target.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        req->set("bitrate", SrsJsonAny::integer(104857601));
+        EXPECT_EQ(2000000, srs_rtc_publish_resolve_bitrate(req.get(), "2000000"));
+
+        req->set("bitrate", SrsJsonAny::integer(-5000));
+        EXPECT_EQ(2000000, srs_rtc_publish_resolve_bitrate(req.get(), "2000000"));
+
+        // Without a query target, no per-request target remains for the vhost fallback.
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), ""));
+    }
+
+    // Malformed query values fall back to the vhost default.
+    if (true) {
+        SrsUniquePtr<SrsJsonObject> req(SrsJsonAny::object());
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), "100k"));
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), "abc"));
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), "-5000"));
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), "104857601"));
+        EXPECT_EQ(0, srs_rtc_publish_resolve_bitrate(req.get(), "0"));
+    }
+}
+
 VOID TEST(SrsGoApiRtcPublishTest, HttpHooksOnPublishSuccess)
 {
     srs_error_t err = srs_success;

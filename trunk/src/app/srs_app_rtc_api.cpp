@@ -29,6 +29,43 @@ using namespace std;
 // To limit user to use too long password, to cause unknown issue.
 #define SRS_ICE_PWD_MAX 32
 
+uint64_t srs_rtc_publish_resolve_bitrate(SrsJsonObject *req, const string &query)
+{
+    uint64_t bitrate = 0;
+
+    // The JSON property is the current contract and wins over the legacy query parameter.
+    SrsJsonAny *prop = req ? req->ensure_property_integer("bitrate") : NULL;
+    if (prop) {
+        int64_t v = prop->to_integer();
+        if (v == 0) {
+            // An explicit zero asks for no per-request target; the query and vhost may still apply.
+        } else if (v > 0 && (uint64_t)v <= SRS_RTC_PUBLISH_BITRATE_MAX) {
+            bitrate = (uint64_t)v;
+        } else {
+            srs_warn("RTC publish: ignore invalid JSON bitrate=%lld", (long long)v);
+        }
+    }
+
+    // The legacy query parameter is the fallback for an absent, zero, or invalid JSON target.
+    if (bitrate == 0 && !query.empty()) {
+        uint64_t v = 0;
+        bool valid = srs_rtc_parse_bitrate(query, v);
+        if (valid && v > 0 && v <= SRS_RTC_PUBLISH_BITRATE_MAX) {
+            bitrate = v;
+        } else if (!valid || v > SRS_RTC_PUBLISH_BITRATE_MAX) {
+            srs_warn("RTC publish: ignore invalid query bitrate=%s", query.c_str());
+        }
+    }
+
+    // The established floor applies only to a positive target; zero keeps the vhost fallback.
+    if (bitrate > 0 && bitrate < SRS_RTC_PUBLISH_BITRATE_MIN) {
+        srs_warn("RTC publish: clamp bitrate=%llu to %d bps", (unsigned long long)bitrate, SRS_RTC_PUBLISH_BITRATE_MIN);
+        bitrate = SRS_RTC_PUBLISH_BITRATE_MIN;
+    }
+
+    return bitrate;
+}
+
 SrsGoApiRtcPlay::SrsGoApiRtcPlay(ISrsRtcApiServer *server)
 {
     server_ = server;
@@ -467,6 +504,9 @@ srs_error_t SrsGoApiRtcPublish::do_serve_http(ISrsHttpResponseWriter *w, ISrsHtt
         tid = prop->to_str();
     }
 
+    // [OpenSight fork] The publishing feedback target in bps, with JSON over query over vhost.
+    uint64_t bitrate = srs_rtc_publish_resolve_bitrate(req.get(), r->query_get("bitrate"));
+
     // The RTC user config object.
     SrsRtcUserConfig ruc;
     ruc.req_->ip_ = clientip;
@@ -500,14 +540,16 @@ srs_error_t SrsGoApiRtcPublish::do_serve_http(ISrsHttpResponseWriter *w, ISrsHtt
     string srtp = r->query_get("encrypt");
     string dtls = r->query_get("dtls");
 
-    srs_trace("RTC publish %s, api=%s, tid=%s, clientip=%s, app=%s, stream=%s, offer=%dB, eip=%s, vcodec=%s, acodec=%s, srtp=%s, dtls=%s",
+    srs_trace("RTC publish %s, api=%s, tid=%s, clientip=%s, app=%s, stream=%s, offer=%dB, eip=%s, vcodec=%s, acodec=%s, srtp=%s, dtls=%s, bitrate=%llu",
               streamurl.c_str(), api.c_str(), tid.c_str(), clientip.c_str(), ruc.req_->app_.c_str(), ruc.req_->stream_.c_str(),
-              remote_sdp_str.length(), eip.c_str(), vcodec.c_str(), acodec.c_str(), srtp.c_str(), dtls.c_str());
+              remote_sdp_str.length(), eip.c_str(), vcodec.c_str(), acodec.c_str(), srtp.c_str(), dtls.c_str(),
+              (unsigned long long)bitrate);
 
     ruc.eip_ = eip;
     ruc.vcodec_ = vcodec;
     ruc.acodec_ = acodec;
     ruc.publish_ = true;
+    ruc.req_->bitrate_ = bitrate;
 
     // For client to specifies whether encrypt by SRTP.
     ruc.dtls_ = (dtls != "false");

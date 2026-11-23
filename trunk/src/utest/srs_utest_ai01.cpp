@@ -740,6 +740,81 @@ VOID TEST(ConfigRtcTest, CheckRtcOpusBitrateEnvironment)
     }
 }
 
+VOID TEST(ConfigRtcTest, CheckRtcPublisherBitrate)
+{
+    srs_error_t err;
+
+    // Omitted or zero vhost target means no default feedback target.
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("__defaultVhost__"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+    }
+
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{enabled on;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+    }
+
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 0;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+    }
+
+    // Valid targets are in bps, including the established top boundary.
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 1000000;}}"));
+        EXPECT_EQ(1000000, conf.get_rtc_bitrate("test.com"));
+
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 64000;}}"));
+        EXPECT_EQ(64000, conf.get_rtc_bitrate("test.com"));
+
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 104857600;}}"));
+        EXPECT_EQ(104857600, conf.get_rtc_bitrate("test.com"));
+    }
+
+    // Positive values below the established floor are clamped to 64000 bps.
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 32000;}}"));
+        EXPECT_EQ(64000, conf.get_rtc_bitrate("test.com"));
+
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 1;}}"));
+        EXPECT_EQ(64000, conf.get_rtc_bitrate("test.com"));
+    }
+
+    // Values above the top boundary, malformed values, and negatives supply no target.
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 104857601;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 100k;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate abc;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate -1;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+    }
+
+    // The directive must pass normal config validation, while unknown RTC directives still fail.
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 1000000;}}"));
+    }
+
+    if (true) {
+        MockSrsConfig conf;
+        HELPER_ASSERT_FAILED(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{publisher_bitrate 1000000;}}"));
+    }
+}
+
 VOID TEST(ConfigRtcTest, CheckRtcAacBitrate)
 {
     srs_error_t err;
