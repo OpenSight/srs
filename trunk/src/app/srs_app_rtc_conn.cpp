@@ -1667,10 +1667,13 @@ srs_error_t SrsRtcPublishStream::send_rtcp_remb()
         return err;
     }
 
-    // The feedback targets the first video SSRC, which must have negotiated goog-remb in the SDP.
+    // The feedback targets the primary SSRC of the first accepted video m-line, which the negotiator
+    // resolved from the offer's FID group. The first track description may be the RTX SSRC when the
+    // offer lists its a=ssrc line first, so its own SSRC is not a safe destination. The goog-remb
+    // capability is still checked on the first track's negotiated payload.
     SrsRtcVideoRecvTrack *track = video_tracks_.at(0);
     SrsRtcTrackDescription *desc = track->get_track_desc();
-    uint32_t ssrc = track->get_ssrc();
+    uint32_t ssrc = req_ ? req_->remb_ssrc_ : 0;
     if (!desc || !desc->media_ || ssrc == 0) {
         return err;
     }
@@ -1727,11 +1730,11 @@ srs_error_t SrsRtcPublishStream::send_rtcp_remb()
     stream.write_1bytes((uint8_t)((exp << 2) + ((mantissa >> 16) & 0x03)));
     stream.write_1bytes((uint8_t)(mantissa >> 8));
     stream.write_1bytes((uint8_t)(mantissa));
-    // SSRC feedback, the first video SSRC.
+    // SSRC feedback, the primary SSRC of the first accepted video m-line.
     stream.write_4bytes(ssrc);
 
     if ((err = receiver_->send_rtcp(stream.data(), stream.pos())) != srs_success) {
-        return srs_error_wrap(err, "rtcp remb send error(ssrc=%u, bitrate=%llu)", ssrc, (unsigned long long)bitrate);
+        return srs_error_wrap(err, "rtcp remb send error(ssrc=%u, bitrate=%" PRIu64 ")", ssrc, bitrate);
     }
 
     return err;
@@ -3588,6 +3591,54 @@ static void srs_rtc_negotiate_remb_feedback(bool remb_for_video, const std::stri
     }
 }
 
+// [OpenSight fork] Resolve the primary SSRC of a video m-line for REMB. Track descriptions are created in
+// a=ssrc line order, before the FID group is applied, so the first description may be the RTX SSRC when
+// the offer lists it first or when both SSRCs share one track id. RFC 5576 defines a FID group as
+// <primary> <rtx>, so prefer the first group's first member, then the first declared SSRC that is not the
+// repair member of a declared group. A zero result means the m-line has no known feedback destination.
+static uint32_t srs_rtc_video_primary_ssrc(const SrsMediaDesc &desc)
+{
+    for (int i = 0; i < (int)desc.ssrc_groups_.size(); ++i) {
+        const SrsSSRCGroup &group = desc.ssrc_groups_.at(i);
+        if (group.semantic_ != "FID" || group.ssrcs_.size() < 2) {
+            continue;
+        }
+
+        // The first FID group names the primary first, whatever the a=ssrc line order is.
+        if (group.ssrcs_.at(0) != 0) {
+            return group.ssrcs_.at(0);
+        }
+    }
+
+    for (int i = 0; i < (int)desc.ssrc_infos_.size(); ++i) {
+        uint32_t ssrc = desc.ssrc_infos_.at(i).ssrc_;
+        if (ssrc == 0) {
+            continue;
+        }
+
+        bool auxiliary = false;
+        for (int j = 0; j < (int)desc.ssrc_groups_.size(); ++j) {
+            const SrsSSRCGroup &group = desc.ssrc_groups_.at(j);
+            if (group.ssrcs_.size() < 2) {
+                continue;
+            }
+            if (group.semantic_ != "FID" && group.semantic_ != "FEC" && group.semantic_ != "FEC-FR") {
+                continue;
+            }
+            if (group.ssrcs_.at(1) == ssrc) {
+                auxiliary = true;
+                break;
+            }
+        }
+
+        if (!auxiliary) {
+            return ssrc;
+        }
+    }
+
+    return 0;
+}
+
 srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserConfig *ruc, SrsRtcSourceDescription *stream_desc)
 {
     srs_error_t err = srs_success;
@@ -3606,6 +3657,9 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
     // per-request value means no override; a zero vhost value means no default. Only an effective zero
     // target disables the feedback.
     req->vhost_bitrate_ = config_->get_rtc_bitrate(req->vhost_);
+    // [OpenSight fork] Resolve the feedback destination below, once, from the first accepted video
+    // m-line, and snapshot it for the sender.
+    req->remb_ssrc_ = 0;
     bool remb_enabled = req->bitrate_ > 0 || req->vhost_bitrate_ > 0;
     // TODO: FIME: Should check packetization-mode=1 also.
     bool has_42e01f = srs_sdp_has_h264_profile(remote_sdp, "42e01f");
@@ -3622,6 +3676,12 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
         // The sender feeds back to the first accepted video track only, so later m-lines must not
         // advertise REMB even when they offer it.
         const bool remb_for_video = remb_enabled && nn_any_video_parsed == 1;
+
+        // [OpenSight fork] Resolve the REMB destination once, from the first accepted video m-line, using
+        // the FID group rather than the order of its track descriptions.
+        if (remote_media_desc.is_video() && nn_any_video_parsed == 1) {
+            req->remb_ssrc_ = srs_rtc_video_primary_ssrc(remote_media_desc);
+        }
 
         SrsUniquePtr<SrsRtcTrackDescription> track_desc(new SrsRtcTrackDescription());
 

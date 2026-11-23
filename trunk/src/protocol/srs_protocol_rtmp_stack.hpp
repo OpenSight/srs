@@ -475,6 +475,10 @@ public:
     // the publisher negotiator and snapshotted here so the answer and the sender share one value
     // across a config reload. Zero means the vhost supplies no default target.
     uint64_t vhost_bitrate_;
+    // [OpenSight fork] The primary video SSRC of the first accepted video m-line, resolved once by the
+    // publisher negotiator from the FID group and snapshotted here so the REMB feedback targets the
+    // primary even when the offer lists its RTX SSRC first. Zero means no known destination.
+    uint32_t remb_ssrc_;
 
 public:
     // The protocol of client:

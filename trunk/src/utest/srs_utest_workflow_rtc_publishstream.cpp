@@ -184,6 +184,9 @@ VOID TEST(BasicWorkflowRtcPublishStreamTest, SendRembTargetForNegotiatedVideo)
     // The negotiator snapshots the vhost default on the request; a conflicting config value proves the
     // sender never reloads it.
     env.req_.vhost_bitrate_ = 1000000;
+    // The negotiator snapshots the FID primary SSRC of the first video m-line; the sender targets it
+    // rather than the first track description's own SSRC.
+    env.req_.remb_ssrc_ = env.factory_.video_ssrc_;
     env.config_.set_rtc_bitrate(0);
 
     SrsUniquePtr<SrsRtcSourceDescription> stream_desc(env.factory_.create_stream_description());
@@ -249,6 +252,7 @@ VOID TEST(BasicWorkflowRtcPublishStreamTest, SkipRembWhenNotNegotiatedOrNoTarget
     if (true) {
         RembTestEnv env;
         env.req_.vhost_bitrate_ = 1000000;
+        env.req_.remb_ssrc_ = env.factory_.video_ssrc_;
 
         SrsUniquePtr<SrsRtcSourceDescription> stream_desc(env.factory_.create_stream_description());
         HELPER_EXPECT_SUCCESS(env.stream_->initialize(&env.req_, stream_desc.get()));
@@ -265,6 +269,7 @@ VOID TEST(BasicWorkflowRtcPublishStreamTest, SkipRembWhenNotNegotiatedOrNoTarget
     if (true) {
         RembTestEnv env;
         env.req_.vhost_bitrate_ = 0;
+        env.req_.remb_ssrc_ = env.factory_.video_ssrc_;
         env.config_.set_rtc_bitrate(1000000);
 
         SrsUniquePtr<SrsRtcSourceDescription> stream_desc(env.factory_.create_stream_description());
@@ -302,6 +307,7 @@ VOID TEST(BasicWorkflowRtcPublishStreamTest, RequestBitrateOverridesVhostForRemb
     RembTestEnv env;
     env.req_.vhost_bitrate_ = 1000000;
     env.req_.bitrate_ = 128000;
+    env.req_.remb_ssrc_ = env.factory_.video_ssrc_;
     env.config_.set_rtc_bitrate(0);
 
     SrsUniquePtr<SrsRtcSourceDescription> stream_desc(env.factory_.create_stream_description());
@@ -323,6 +329,7 @@ VOID TEST(BasicWorkflowRtcPublishStreamTest, RembTargetsFirstVideoTrackOnly)
 
     RembTestEnv env;
     env.req_.vhost_bitrate_ = 1000000;
+    env.req_.remb_ssrc_ = env.factory_.video_ssrc_;
 
     SrsUniquePtr<SrsRtcSourceDescription> stream_desc(new SrsRtcSourceDescription());
     stream_desc->video_track_descs_.push_back(env.factory_.create_video_track(env.factory_.video_ssrc_, "video-0", "0"));

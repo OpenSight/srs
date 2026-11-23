@@ -42,7 +42,7 @@ uint64_t srs_rtc_publish_resolve_bitrate(SrsJsonObject *req, const string &query
         } else if (v > 0 && (uint64_t)v <= SRS_RTC_PUBLISH_BITRATE_MAX) {
             bitrate = (uint64_t)v;
         } else {
-            srs_warn("RTC publish: ignore invalid JSON bitrate=%lld", (long long)v);
+            srs_warn("RTC publish: ignore invalid JSON bitrate=%" PRId64, v);
         }
     }
 
@@ -60,7 +60,7 @@ uint64_t srs_rtc_publish_resolve_bitrate(SrsJsonObject *req, const string &query
 
     // The established floor applies only to a positive target; zero keeps the vhost fallback.
     if (bitrate > 0 && bitrate < SRS_RTC_PUBLISH_BITRATE_MIN) {
-        srs_warn("RTC publish: clamp bitrate=%llu to %d bps", (unsigned long long)bitrate, SRS_RTC_PUBLISH_BITRATE_MIN);
+        srs_warn("RTC publish: clamp bitrate=%" PRIu64 " to %d bps", bitrate, SRS_RTC_PUBLISH_BITRATE_MIN);
         bitrate = SRS_RTC_PUBLISH_BITRATE_MIN;
     }
 
@@ -541,10 +541,10 @@ srs_error_t SrsGoApiRtcPublish::do_serve_http(ISrsHttpResponseWriter *w, ISrsHtt
     string srtp = r->query_get("encrypt");
     string dtls = r->query_get("dtls");
 
-    srs_trace("RTC publish %s, api=%s, tid=%s, clientip=%s, app=%s, stream=%s, offer=%dB, eip=%s, vcodec=%s, acodec=%s, srtp=%s, dtls=%s, bitrate=%llu",
+    srs_trace("RTC publish %s, api=%s, tid=%s, clientip=%s, app=%s, stream=%s, offer=%dB, eip=%s, vcodec=%s, acodec=%s, srtp=%s, dtls=%s, bitrate=%" PRIu64,
               streamurl.c_str(), api.c_str(), tid.c_str(), clientip.c_str(), ruc.req_->app_.c_str(), ruc.req_->stream_.c_str(),
               remote_sdp_str.length(), eip.c_str(), vcodec.c_str(), acodec.c_str(), srtp.c_str(), dtls.c_str(),
-              (unsigned long long)bitrate);
+              bitrate);
 
     ruc.eip_ = eip;
     ruc.vcodec_ = vcodec;

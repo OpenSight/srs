@@ -801,6 +801,10 @@ VOID TEST(ConfigRtcTest, CheckRtcPublisherBitrate)
 
         HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate -1;}}"));
         EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
+
+        // A decimal value beyond uint64_t overflows the bounded parse and supplies no target.
+        HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost test.com{rtc{bitrate 18446744073709551616;}}"));
+        EXPECT_EQ(0, conf.get_rtc_bitrate("test.com"));
     }
 
     // The directive must pass normal config validation, while unknown RTC directives still fail.

@@ -4164,21 +4164,24 @@ bool srs_rtc_parse_bitrate(const string &value, uint64_t &bitrate)
     }
 
     // Accept only plain non-negative decimal digits. This intentionally rejects signs, spaces,
-    // suffixes and trailing garbage instead of inheriting atoll()'s partial parse.
+    // suffixes and trailing garbage instead of inheriting atoll()'s partial parse, and checks the
+    // accumulation overflow directly rather than depending on the platform's strtoull().
+    const uint64_t max = ~((uint64_t)0);
+    uint64_t v = 0;
     for (size_t i = 0; i < value.length(); i++) {
-        if (value[i] < '0' || value[i] > '9') {
+        char ch = value[i];
+        if (ch < '0' || ch > '9') {
             return false;
         }
+
+        uint64_t digit = (uint64_t)(ch - '0');
+        if (v > (max - digit) / 10) {
+            return false;
+        }
+        v = v * 10 + digit;
     }
 
-    errno = 0;
-    char *end = NULL;
-    unsigned long long v = ::strtoull(value.c_str(), &end, 10);
-    if (errno == ERANGE || end == value.c_str() || *end != '\0') {
-        return false;
-    }
-
-    bitrate = (uint64_t)v;
+    bitrate = v;
     return true;
 }
 
@@ -4207,12 +4210,12 @@ uint64_t SrsConfig::get_rtc_bitrate(string vhost)
     }
 
     if (v > SRS_RTC_PUBLISH_BITRATE_MAX) {
-        srs_warn("Invalid vhost.rtc.bitrate(%llu), no target", (unsigned long long)v);
+        srs_warn("Invalid vhost.rtc.bitrate(%" PRIu64 "), no target", v);
         return DEFAULT;
     }
 
     if (v < SRS_RTC_PUBLISH_BITRATE_MIN) {
-        srs_warn("Invalid vhost.rtc.bitrate(%llu), reset it to %d bps", (unsigned long long)v, SRS_RTC_PUBLISH_BITRATE_MIN);
+        srs_warn("Invalid vhost.rtc.bitrate(%" PRIu64 "), reset it to %d bps", v, SRS_RTC_PUBLISH_BITRATE_MIN);
         v = SRS_RTC_PUBLISH_BITRATE_MIN;
     }
 

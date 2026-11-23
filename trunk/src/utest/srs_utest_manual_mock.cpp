@@ -556,6 +556,7 @@ ISrsRequest *MockRtcAsyncCallRequest::copy()
     MockRtcAsyncCallRequest *cp = new MockRtcAsyncCallRequest(vhost_, app_, stream_);
     cp->bitrate_ = bitrate_;
     cp->vhost_bitrate_ = vhost_bitrate_;
+    cp->remb_ssrc_ = remb_ssrc_;
     return cp;
 }
 
@@ -2126,6 +2127,7 @@ ISrsRequest *MockRequest::copy()
     req->ip_ = ip_;
     req->bitrate_ = bitrate_;
     req->vhost_bitrate_ = vhost_bitrate_;
+    req->remb_ssrc_ = remb_ssrc_;
     return req;
 }
 
