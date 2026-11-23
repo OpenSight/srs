@@ -2636,6 +2636,54 @@ static std::string srs_test_publisher_offer_rtx_first()
         "a=ice-pwd:jBua8YGWQKc/Vn6Y9EZ9+0\r\n";
 }
 
+// [OpenSight fork] Build a publisher offer whose single video m-line declares the given a=ssrc-group and
+// a=ssrc lines in source order. Used to verify that REMB target selection follows the declared SSRC
+// order rather than the order of the FID groups.
+static std::string srs_test_publisher_offer_video_ssrcs(const std::string &decls)
+{
+    std::string sdp =
+        "v=0\r\n"
+        "o=- rtc 4158491451 0 IN IP4 127.0.0.1\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE video audio\r\n"
+        "a=msid-semantic:WMS *\r\n"
+        "a=ice-options:ice2,trickle\r\n"
+        "a=fingerprint:sha-256 28:37:F7:18:77:FC:46:33:6F:B2:0F:12:83:C2:BF:5C:61:5E:96:EB:4B:B9:97:81:92:7C:82:10:97:B8:8E:60\r\n"
+        "m=video 56144 UDP/TLS/RTP/SAVPF 96 97\r\n"
+        "c=IN IP4 172.24.64.1\r\n"
+        "a=mid:video\r\n"
+        "a=sendonly\r\n";
+    sdp += decls;
+    sdp +=
+        "a=rtcp-mux\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=rtpmap:97 rtx/90000\r\n"
+        "a=fmtp:97 apt=96\r\n"
+        "a=rtcp-fb:96 nack\r\n"
+        "a=rtcp-fb:96 nack pli\r\n"
+        "a=rtcp-fb:96 transport-cc\r\n"
+        "a=rtcp-fb:96 goog-remb\r\n"
+        "a=fmtp:96 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1\r\n"
+        "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n"
+        "a=setup:actpass\r\n"
+        "a=ice-ufrag:fEw/\r\n"
+        "a=ice-pwd:jBua8YGWQKc/Vn6Y9EZ9+0\r\n"
+        "m=audio 56144 UDP/TLS/RTP/SAVPF 111\r\n"
+        "c=IN IP4 172.24.64.1\r\n"
+        "a=mid:audio\r\n"
+        "a=sendonly\r\n"
+        "a=ssrc:46 cname:audio-send\r\n"
+        "a=ssrc:46 msid:stream audio\r\n"
+        "a=rtcp-mux\r\n"
+        "a=rtpmap:111 opus/48000/2\r\n"
+        "a=setup:actpass\r\n"
+        "a=ice-ufrag:fEw/\r\n"
+        "a=ice-pwd:jBua8YGWQKc/Vn6Y9EZ9+0\r\n";
+
+    return sdp;
+}
+
 // [OpenSight fork] Whether the first negotiated video track keeps the feedback.
 static bool srs_test_video_rtcp_fb_has(SrsRtcSourceDescription *desc, const std::string &fb)
 {
@@ -3054,6 +3102,219 @@ VOID TEST(SrsRtcPublisherNegotiatorTest, RembTimerTargetsFidPrimaryWhenRtxSsrcIs
     EXPECT_NE(43u, feedback_ssrc);
 
     stream->stop();
+}
+
+// [OpenSight fork] Negotiate the offer, then run the lifecycle-owned RTCP timer once and return the
+// feedback SSRC of the single REMB packet. This uses the same negotiation-to-sender seam as the
+// production publisher. A zero result with a success err means no REMB was sent.
+static uint32_t srs_test_offer_timer_remb_ssrc(const std::string &offer, srs_error_t &err)
+{
+    err = srs_success;
+
+    MockAppConfig cfg;
+    cfg.set_rtc_bitrate(1000000);
+
+    SrsRtcPublisherNegotiator negotiator;
+    negotiator.config_ = &cfg;
+
+    SrsRtcUserConfig ruc;
+    ruc.req_->vhost_ = "test.vhost";
+    ruc.req_->app_ = "live";
+    ruc.req_->stream_ = "stream1";
+    ruc.req_->bitrate_ = 0;
+    ruc.publish_ = true;
+    ruc.dtls_ = true;
+    ruc.srtp_ = true;
+    ruc.audio_before_video_ = false;
+    ruc.remote_sdp_str_ = offer;
+
+    if ((err = ruc.remote_sdp_.parse(offer)) != srs_success) {
+        return 0;
+    }
+
+    SrsUniquePtr<SrsRtcSourceDescription> desc(new SrsRtcSourceDescription());
+    if ((err = negotiator.negotiate_publish_capability(&ruc, desc.get())) != srs_success) {
+        return 0;
+    }
+
+    MockRtcSourceManager rtc_sources;
+    MockAppStatistic stat;
+    MockRtcAsyncTaskExecutor exec;
+    MockExpire expire;
+    MockRtcPacketReceiver receiver;
+    SrsContextId cid;
+    cid.set_value("remb-order-cid");
+
+    SrsUniquePtr<SrsRtcPublishStream> stream(new SrsRtcPublishStream(&exec, &expire, &receiver, cid));
+    stream->config_ = &cfg;
+    stream->rtc_sources_ = &rtc_sources;
+    stream->stat_ = &stat;
+
+    if ((err = stream->initialize(ruc.req_, desc.get())) != srs_success) {
+        return 0;
+    }
+
+    SrsRtcPublishRtcpTimer *timer = dynamic_cast<SrsRtcPublishRtcpTimer *>(stream->timer_rtcp_);
+    if (!timer) {
+        return 0;
+    }
+    timer->shared_timer_->timer1s()->unsubscribe(timer);
+
+    if ((err = stream->start()) != srs_success) {
+        return 0;
+    }
+    if ((err = timer->on_timer(1 * SRS_UTIME_SECONDS)) != srs_success) {
+        return 0;
+    }
+
+    uint32_t ssrc = 0;
+    if (receiver.sent_rtcp_packets_.size() == 1) {
+        std::string pkt = receiver.sent_rtcp_packets_.back();
+        if (pkt.size() == 24) {
+            const unsigned char *p = (const unsigned char *)pkt.data();
+            ssrc = (uint32_t)((p[20] << 24) | (p[21] << 16) | (p[22] << 8) | p[23]);
+        }
+    }
+
+    stream->stop();
+    return ssrc;
+}
+
+// [OpenSight fork] FID groups identify the roles inside each pair, not a priority among primaries. The
+// first declared non-repair SSRC stays the REMB destination even when the FID groups appear in a
+// different order, when an earlier primary has no FID group, or when the primary is only in grouping.
+VOID TEST(SrsRtcPublisherNegotiatorTest, RembTargetsFirstDeclaredPrimaryInSourceOrder)
+{
+    srs_error_t err;
+
+    // Two declared primaries 42 and 44, with the FID groups in reverse order (44 first). Source order
+    // still selects 42, not the first group's primary 44.
+    if (true) {
+        std::string offer = srs_test_publisher_offer_video_ssrcs(
+            "a=ssrc-group:FID 44 45\r\n"
+            "a=ssrc-group:FID 42 43\r\n"
+            "a=ssrc:42 cname:video0\r\n"
+            "a=ssrc:42 msid:stream video0\r\n"
+            "a=ssrc:43 cname:video0\r\n"
+            "a=ssrc:43 msid:stream video0\r\n"
+            "a=ssrc:44 cname:video1\r\n"
+            "a=ssrc:44 msid:stream video1\r\n"
+            "a=ssrc:45 cname:video1\r\n"
+            "a=ssrc:45 msid:stream video1\r\n");
+
+        MockAppConfig cfg;
+        cfg.set_rtc_bitrate(1000000);
+        SrsRtcPublisherNegotiator negotiator;
+        negotiator.config_ = &cfg;
+
+        SrsRtcUserConfig ruc;
+        ruc.req_->vhost_ = "test.vhost";
+        ruc.req_->app_ = "live";
+        ruc.req_->stream_ = "stream1";
+        ruc.req_->bitrate_ = 0;
+        ruc.publish_ = true;
+        ruc.dtls_ = true;
+        ruc.srtp_ = true;
+        ruc.audio_before_video_ = false;
+        ruc.remote_sdp_str_ = offer;
+
+        HELPER_EXPECT_SUCCESS(ruc.remote_sdp_.parse(offer));
+
+        SrsUniquePtr<SrsRtcSourceDescription> desc(new SrsRtcSourceDescription());
+        HELPER_EXPECT_SUCCESS(negotiator.negotiate_publish_capability(&ruc, desc.get()));
+
+        EXPECT_EQ(42u, ruc.req_->remb_ssrc_);
+        ASSERT_EQ(2, (int)desc->video_track_descs_.size());
+        EXPECT_EQ(42u, desc->video_track_descs_[0]->ssrc_);
+        EXPECT_EQ(44u, desc->video_track_descs_[1]->ssrc_);
+
+        SrsSdp answer;
+        HELPER_EXPECT_SUCCESS(negotiator.generate_publish_local_sdp(ruc.req_, answer, desc.get(), true, false));
+        EXPECT_TRUE(srs_test_answer_video_fb_has(answer, 0, "goog-remb"));
+
+        err = srs_success;
+        EXPECT_EQ(42u, srs_test_offer_timer_remb_ssrc(offer, err));
+        HELPER_EXPECT_SUCCESS(err);
+    }
+
+    // An earlier unpaired primary 42 precedes the FID-enabled primary 44, and stays the destination.
+    if (true) {
+        std::string offer = srs_test_publisher_offer_video_ssrcs(
+            "a=ssrc-group:FID 44 45\r\n"
+            "a=ssrc:42 cname:video0\r\n"
+            "a=ssrc:42 msid:stream video0\r\n"
+            "a=ssrc:44 cname:video1\r\n"
+            "a=ssrc:44 msid:stream video1\r\n"
+            "a=ssrc:45 cname:video1\r\n"
+            "a=ssrc:45 msid:stream video1\r\n");
+
+        MockAppConfig cfg;
+        cfg.set_rtc_bitrate(1000000);
+        SrsRtcPublisherNegotiator negotiator;
+        negotiator.config_ = &cfg;
+
+        SrsRtcUserConfig ruc;
+        ruc.req_->vhost_ = "test.vhost";
+        ruc.req_->app_ = "live";
+        ruc.req_->stream_ = "stream1";
+        ruc.req_->bitrate_ = 0;
+        ruc.publish_ = true;
+        ruc.dtls_ = true;
+        ruc.srtp_ = true;
+        ruc.audio_before_video_ = false;
+        ruc.remote_sdp_str_ = offer;
+
+        HELPER_EXPECT_SUCCESS(ruc.remote_sdp_.parse(offer));
+
+        SrsUniquePtr<SrsRtcSourceDescription> desc(new SrsRtcSourceDescription());
+        HELPER_EXPECT_SUCCESS(negotiator.negotiate_publish_capability(&ruc, desc.get()));
+
+        EXPECT_EQ(42u, ruc.req_->remb_ssrc_);
+        ASSERT_EQ(2, (int)desc->video_track_descs_.size());
+        EXPECT_EQ(42u, desc->video_track_descs_[0]->ssrc_);
+        EXPECT_EQ(44u, desc->video_track_descs_[1]->ssrc_);
+
+        err = srs_success;
+        EXPECT_EQ(42u, srs_test_offer_timer_remb_ssrc(offer, err));
+        HELPER_EXPECT_SUCCESS(err);
+    }
+
+    // The primary 42 is only in the FID group and the declared line is its RTX 43: the group supplies it.
+    if (true) {
+        std::string offer = srs_test_publisher_offer_video_ssrcs(
+            "a=ssrc-group:FID 42 43\r\n"
+            "a=ssrc:43 cname:video-rtx\r\n"
+            "a=ssrc:43 msid:stream video\r\n");
+
+        MockAppConfig cfg;
+        cfg.set_rtc_bitrate(1000000);
+        SrsRtcPublisherNegotiator negotiator;
+        negotiator.config_ = &cfg;
+
+        SrsRtcUserConfig ruc;
+        ruc.req_->vhost_ = "test.vhost";
+        ruc.req_->app_ = "live";
+        ruc.req_->stream_ = "stream1";
+        ruc.req_->bitrate_ = 0;
+        ruc.publish_ = true;
+        ruc.dtls_ = true;
+        ruc.srtp_ = true;
+        ruc.audio_before_video_ = false;
+        ruc.remote_sdp_str_ = offer;
+
+        HELPER_EXPECT_SUCCESS(ruc.remote_sdp_.parse(offer));
+
+        SrsUniquePtr<SrsRtcSourceDescription> desc(new SrsRtcSourceDescription());
+        HELPER_EXPECT_SUCCESS(negotiator.negotiate_publish_capability(&ruc, desc.get()));
+
+        EXPECT_EQ(42u, ruc.req_->remb_ssrc_);
+        ASSERT_EQ(1, (int)desc->video_track_descs_.size());
+        EXPECT_EQ(43u, desc->video_track_descs_[0]->ssrc_);
+
+        err = srs_success;
+        EXPECT_EQ(42u, srs_test_offer_timer_remb_ssrc(offer, err));
+        HELPER_EXPECT_SUCCESS(err);
+    }
 }
 
 // Test audio-only libdatachannel scenario WITHOUT SSRC info.

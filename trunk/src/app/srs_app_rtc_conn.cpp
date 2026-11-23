@@ -1668,9 +1668,10 @@ srs_error_t SrsRtcPublishStream::send_rtcp_remb()
     }
 
     // The feedback targets the primary SSRC of the first accepted video m-line, which the negotiator
-    // resolved from the offer's FID group. The first track description may be the RTX SSRC when the
-    // offer lists its a=ssrc line first, so its own SSRC is not a safe destination. The goog-remb
-    // capability is still checked on the first track's negotiated payload.
+    // selected from the m-line's declared SSRC order while skipping FID/FEC repair members. The first
+    // track description may be the RTX SSRC when the offer lists its a=ssrc line first, so its own SSRC
+    // is not a safe destination. The goog-remb capability is still checked on the first track's
+    // negotiated payload.
     SrsRtcVideoRecvTrack *track = video_tracks_.at(0);
     SrsRtcTrackDescription *desc = track->get_track_desc();
     uint32_t ssrc = req_ ? req_->remb_ssrc_ : 0;
@@ -3591,48 +3592,53 @@ static void srs_rtc_negotiate_remb_feedback(bool remb_for_video, const std::stri
     }
 }
 
+// [OpenSight fork] Whether the SSRC is the repair member of a declared FID, FEC or FEC-FR group. The
+// groups name roles inside a pair; the first member is the source or primary, the second is auxiliary.
+static bool srs_rtc_is_auxiliary_ssrc(const SrsMediaDesc &desc, uint32_t ssrc)
+{
+    for (int i = 0; i < (int)desc.ssrc_groups_.size(); ++i) {
+        const SrsSSRCGroup &group = desc.ssrc_groups_.at(i);
+        if (group.ssrcs_.size() < 2) {
+            continue;
+        }
+        if (group.semantic_ != "FID" && group.semantic_ != "FEC" && group.semantic_ != "FEC-FR") {
+            continue;
+        }
+        if (group.ssrcs_.at(1) == ssrc) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // [OpenSight fork] Resolve the primary SSRC of a video m-line for REMB. Track descriptions are created in
 // a=ssrc line order, before the FID group is applied, so the first description may be the RTX SSRC when
-// the offer lists it first or when both SSRCs share one track id. RFC 5576 defines a FID group as
-// <primary> <rtx>, so prefer the first group's first member, then the first declared SSRC that is not the
-// repair member of a declared group. A zero result means the m-line has no known feedback destination.
+// the offer lists it first or when both SSRCs share one track id. FID groups name the roles inside each
+// pair, not a priority among multiple primaries, so walk the declared SSRCs in source order and take the
+// first real primary. Only when the primary is named solely by a FID group does the group supply it.
+// A zero result means the m-line has no known feedback destination.
 static uint32_t srs_rtc_video_primary_ssrc(const SrsMediaDesc &desc)
 {
+    for (int i = 0; i < (int)desc.ssrc_infos_.size(); ++i) {
+        uint32_t ssrc = desc.ssrc_infos_.at(i).ssrc_;
+        if (ssrc == 0 || srs_rtc_is_auxiliary_ssrc(desc, ssrc)) {
+            continue;
+        }
+
+        return ssrc;
+    }
+
+    // The primary may only be present in grouping, with no a=ssrc line of its own.
     for (int i = 0; i < (int)desc.ssrc_groups_.size(); ++i) {
         const SrsSSRCGroup &group = desc.ssrc_groups_.at(i);
         if (group.semantic_ != "FID" || group.ssrcs_.size() < 2) {
             continue;
         }
 
-        // The first FID group names the primary first, whatever the a=ssrc line order is.
-        if (group.ssrcs_.at(0) != 0) {
-            return group.ssrcs_.at(0);
-        }
-    }
-
-    for (int i = 0; i < (int)desc.ssrc_infos_.size(); ++i) {
-        uint32_t ssrc = desc.ssrc_infos_.at(i).ssrc_;
-        if (ssrc == 0) {
-            continue;
-        }
-
-        bool auxiliary = false;
-        for (int j = 0; j < (int)desc.ssrc_groups_.size(); ++j) {
-            const SrsSSRCGroup &group = desc.ssrc_groups_.at(j);
-            if (group.ssrcs_.size() < 2) {
-                continue;
-            }
-            if (group.semantic_ != "FID" && group.semantic_ != "FEC" && group.semantic_ != "FEC-FR") {
-                continue;
-            }
-            if (group.ssrcs_.at(1) == ssrc) {
-                auxiliary = true;
-                break;
-            }
-        }
-
-        if (!auxiliary) {
-            return ssrc;
+        uint32_t primary = group.ssrcs_.at(0);
+        if (primary != 0 && !srs_rtc_is_auxiliary_ssrc(desc, primary)) {
+            return primary;
         }
     }
 
@@ -3677,8 +3683,8 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
         // advertise REMB even when they offer it.
         const bool remb_for_video = remb_enabled && nn_any_video_parsed == 1;
 
-        // [OpenSight fork] Resolve the REMB destination once, from the first accepted video m-line, using
-        // the FID group rather than the order of its track descriptions.
+        // [OpenSight fork] Resolve the REMB destination once, from the first accepted video m-line's
+        // declared SSRC order, using FID only to identify each pair's repair member.
         if (remote_media_desc.is_video() && nn_any_video_parsed == 1) {
             req->remb_ssrc_ = srs_rtc_video_primary_ssrc(remote_media_desc);
         }
