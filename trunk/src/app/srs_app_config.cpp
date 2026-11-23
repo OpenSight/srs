@@ -2336,7 +2336,7 @@ srs_error_t SrsConfig::check_normal_config()
             } else if (n == "rtc") {
                 for (int j = 0; j < (int)conf->directives_.size(); j++) {
                     string m = conf->at(j)->name_;
-                    if (m != "enabled" && m != "nack" && m != "twcc" && m != "nack_no_copy" && m != "bframe" && m != "aac" && m != "stun_timeout" && m != "stun_strict_check" && m != "dtls_role" && m != "dtls_version" && m != "drop_for_pt" && m != "rtc_to_rtmp" && m != "pli_for_rtmp" && m != "rtmp_to_rtc" && m != "keep_bframe" && m != "opus_bitrate" && m != "aac_bitrate" && m != "keep_avc_nalu_sei" && m != "init_rate_from_sdp" && m != "keep_original_ssrc") {
+                    if (m != "enabled" && m != "nack" && m != "twcc" && m != "nack_no_copy" && m != "bframe" && m != "aac" && m != "stun_timeout" && m != "stun_strict_check" && m != "dtls_role" && m != "dtls_version" && m != "drop_for_pt" && m != "rtc_to_rtmp" && m != "pli_for_rtmp" && m != "rtmp_to_rtc" && m != "keep_bframe" && m != "opus_bitrate" && m != "aac_bitrate" && m != "bitrate" && m != "keep_avc_nalu_sei" && m != "init_rate_from_sdp" && m != "keep_original_ssrc") {
                         return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "illegal vhost.rtc.%s of %s", m.c_str(), vhost->arg0().c_str());
                     }
                 }
@@ -4151,6 +4151,72 @@ int SrsConfig::get_rtc_aac_bitrate(string vhost)
     if (v < 8000 || v > 320000) {
         srs_warn("Reset aac btirate %d to %d", v, DEFAULT);
         return DEFAULT;
+    }
+
+    return v;
+}
+
+bool srs_rtc_parse_bitrate(const string &value, uint64_t &bitrate)
+{
+    bitrate = 0;
+    if (value.empty()) {
+        return false;
+    }
+
+    // Accept only plain non-negative decimal digits. This intentionally rejects signs, spaces,
+    // suffixes and trailing garbage instead of inheriting atoll()'s partial parse, and checks the
+    // accumulation overflow directly rather than depending on the platform's strtoull().
+    const uint64_t max = ~((uint64_t)0);
+    uint64_t v = 0;
+    for (size_t i = 0; i < value.length(); i++) {
+        char ch = value[i];
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+
+        uint64_t digit = (uint64_t)(ch - '0');
+        if (v > (max - digit) / 10) {
+            return false;
+        }
+        v = v * 10 + digit;
+    }
+
+    bitrate = v;
+    return true;
+}
+
+uint64_t SrsConfig::get_rtc_bitrate(string vhost)
+{
+    static uint64_t DEFAULT = 0;
+
+    SrsConfDirective *conf = get_rtc(vhost);
+    if (!conf) {
+        return DEFAULT;
+    }
+
+    conf = conf->get("bitrate");
+    if (!conf || conf->arg0().empty()) {
+        return DEFAULT;
+    }
+
+    uint64_t v = 0;
+    if (!srs_rtc_parse_bitrate(conf->arg0(), v)) {
+        srs_warn("Invalid vhost.rtc.bitrate(%s), no target", conf->arg0().c_str());
+        return DEFAULT;
+    }
+
+    if (v == 0) {
+        return DEFAULT;
+    }
+
+    if (v > SRS_RTC_PUBLISH_BITRATE_MAX) {
+        srs_warn("Invalid vhost.rtc.bitrate(%" PRIu64 "), no target", v);
+        return DEFAULT;
+    }
+
+    if (v < SRS_RTC_PUBLISH_BITRATE_MIN) {
+        srs_warn("Invalid vhost.rtc.bitrate(%" PRIu64 "), reset it to %d bps", v, SRS_RTC_PUBLISH_BITRATE_MIN);
+        v = SRS_RTC_PUBLISH_BITRATE_MIN;
     }
 
     return v;

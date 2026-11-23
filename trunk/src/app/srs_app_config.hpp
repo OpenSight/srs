@@ -30,6 +30,14 @@ class SrsConfig;
 class SrsJsonArray;
 class SrsConfDirective;
 
+// [OpenSight fork] The established range of the WebRTC publishing feedback target, in bps.
+#define SRS_RTC_PUBLISH_BITRATE_MIN 64000
+#define SRS_RTC_PUBLISH_BITRATE_MAX (100 * 1024 * 1024)
+
+// [OpenSight fork] Parse a strict non-negative decimal bitrate in bps. Return false for an empty,
+// signed, non-decimal, trailing-garbage, or overflowing value.
+extern bool srs_rtc_parse_bitrate(const std::string &value, uint64_t &bitrate);
+
 /**
  * whether the two vector actual equals, for instance,
  *      srs_vector_actual_equals([0, 1, 2], [0, 1, 2])      is true
@@ -553,6 +561,8 @@ public:
     virtual bool get_rtc_server_merge_nalus() = 0;
     virtual srs_utime_t get_rtc_pli_for_rtmp(std::string vhost) = 0;
     virtual int get_rtc_opus_bitrate(std::string vhost) = 0;
+    // [OpenSight fork] The WebRTC publishing REMB target in bps, 0 means no target.
+    virtual uint64_t get_rtc_bitrate(std::string vhost) = 0;
     virtual bool get_vhost_is_edge(std::string vhost) = 0;
     virtual bool get_atc_auto(std::string vhost) = 0;
     virtual bool get_reduce_sequence_header(std::string vhost) = 0;
@@ -925,6 +935,7 @@ public:
     bool get_rtc_twcc_enabled(std::string vhost);
     int get_rtc_opus_bitrate(std::string vhost);
     int get_rtc_aac_bitrate(std::string vhost);
+    uint64_t get_rtc_bitrate(std::string vhost);
     bool get_rtc_init_rate_from_sdp(std::string vhost);
     bool get_rtc_keep_original_ssrc(std::string vhost);
 

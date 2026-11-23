@@ -13,6 +13,7 @@
 
 class SrsServer;
 class ISrsRequest;
+class SrsJsonObject;
 class SrsSdp;
 class SrsRtcUserConfig;
 class ISrsRtcApiServer;
@@ -22,6 +23,13 @@ class ISrsStatistic;
 class ISrsRtcSourceManager;
 class ISrsLiveSourceManager;
 class ISrsHttpHooks;
+
+// [OpenSight fork] Resolve the feedback target in bps for the legacy /rtc/v1/publish/ request.
+// A valid nonzero JSON bitrate wins over the legacy query bitrate; a zero or invalid value falls
+// back to the next source. The returned 0 means no per-request target, so the per-vhost default
+// applies. Positive values below the established floor are clamped, and values above the limit
+// are ignored.
+extern uint64_t srs_rtc_publish_resolve_bitrate(SrsJsonObject *req, const std::string &query);
 
 class SrsGoApiRtcPlay : public ISrsHttpHandler
 {

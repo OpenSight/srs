@@ -1131,6 +1131,15 @@ srs_error_t SrsRtcPublishRtcpTimer::on_timer(srs_utime_t interval)
         srs_freep(err);
     }
 
+    // [OpenSight fork] Drive both the REMB startup ramp and the periodic refresh from this lifecycle-owned
+    // timer, one feedback per tick: the first four started ticks emit /4, /3, /2 and the full target, then
+    // every tick refreshes the full target (about 1s apart). This keeps sends and mutex waits off the RTP
+    // input coroutine, and the timer is unsubscribed before the publisher and transport are freed.
+    if ((err = sender_->send_rtcp_remb()) != srs_success) {
+        srs_warn("REMB err %s", srs_error_desc(err).c_str());
+        srs_freep(err);
+    }
+
     return err;
 }
 
@@ -1291,6 +1300,9 @@ SrsRtcPublishStream::SrsRtcPublishStream(ISrsExecRtcAsyncTask *exec, ISrsExpire 
     nack_enabled_ = false;
     nack_no_copy_ = false;
     pt_to_drop_ = 0;
+    bitrate_ = 0;
+    remb_startup_ = 4;
+    lock_remb_ = srs_mutex_new();
 
     nn_audio_frames_ = 0;
     nn_video_frames_ = 0;
@@ -1328,6 +1340,8 @@ SrsRtcPublishStream::~SrsRtcPublishStream()
     srs_freep(timer_rtcp_);
     srs_freep(timer_twcc_);
     srs_freep(rtcp_twcc_);
+    // The timers may call the sender, so they are freed before the REMB lock.
+    srs_mutex_destroy(lock_remb_);
 
     source_->set_publish_stream(NULL);
     source_->on_unpublish();
@@ -1424,6 +1438,15 @@ srs_error_t SrsRtcPublishStream::initialize(ISrsRequest *r, SrsRtcSourceDescript
     nack_no_copy_ = config_->get_rtc_nack_no_copy(req_->vhost_);
     pt_to_drop_ = (uint16_t)config_->get_rtc_drop_for_pt(req_->vhost_);
     twcc_enabled_ = config_->get_rtc_twcc_enabled(req_->vhost_);
+
+    // [OpenSight fork] Use the vhost target snapshotted by the negotiator, never reload the config here,
+    // so the answer and the sender share one resolution. A nonzero per-request target keeps priority.
+    bitrate_ = req_->vhost_bitrate_;
+    if (req_->bitrate_ != 0) {
+        bitrate_ = req_->bitrate_;
+    }
+    // [OpenSight fork] Ramp the first four feedbacks as legacy does.
+    remb_startup_ = 4;
 
     // No TWCC when negotiate, disable it.
     if (twcc_id <= 0) {
@@ -1530,6 +1553,11 @@ srs_error_t SrsRtcPublishStream::start()
 void SrsRtcPublishStream::stop()
 {
     pli_worker_->stop();
+
+    // [OpenSight fork] Prevent any later REMB send or ramp consumption. The RTCP timer is unsubscribed
+    // when the publisher is destroyed, and the timer callback re-checks this flag under the REMB lock.
+    SrsLocker(&lock_remb_);
+    is_sender_started_ = false;
 }
 
 void SrsRtcPublishStream::set_all_tracks_status(bool status)
@@ -1615,6 +1643,99 @@ srs_error_t SrsRtcPublishStream::send_rtcp_xr_rrtr()
         if ((err = track->send_rtcp_xr_rrtr()) != srs_success) {
             return srs_error_wrap(err, "track=%s", track->get_track_id().c_str());
         }
+    }
+
+    return err;
+}
+
+srs_error_t SrsRtcPublishStream::send_rtcp_remb()
+{
+    srs_error_t err = srs_success;
+
+    // Only the lifecycle-owned RTCP timer sends REMB, so this never runs on the RTP input path. The lock
+    // serializes the send with stop() and with the publisher destruction ordering.
+    SrsLocker(&lock_remb_);
+
+    // Never consume the startup ramp before the sender and its transport are fully started, and never
+    // send after stop() has cleared the started flag.
+    if (!is_sender_started_) {
+        return err;
+    }
+
+    // No target or no video track, nothing to feedback.
+    if (bitrate_ == 0 || video_tracks_.empty() || !receiver_) {
+        return err;
+    }
+
+    // The feedback targets the primary SSRC of the first accepted video m-line, which the negotiator
+    // selected from the m-line's declared SSRC order while skipping FID/FEC repair members. The first
+    // track description may be the RTX SSRC when the offer lists its a=ssrc line first, so its own SSRC
+    // is not a safe destination. The goog-remb capability is still checked on the first track's
+    // negotiated payload.
+    SrsRtcVideoRecvTrack *track = video_tracks_.at(0);
+    SrsRtcTrackDescription *desc = track->get_track_desc();
+    uint32_t ssrc = req_ ? req_->remb_ssrc_ : 0;
+    if (!desc || !desc->media_ || ssrc == 0) {
+        return err;
+    }
+
+    bool remb_negotiated = false;
+    std::vector<std::string> &rtcp_fbs = desc->media_->rtcp_fbs_;
+    for (int i = 0; i < (int)rtcp_fbs.size(); i++) {
+        if (rtcp_fbs.at(i) == "goog-remb") {
+            remb_negotiated = true;
+            break;
+        }
+    }
+    if (!remb_negotiated) {
+        return err;
+    }
+
+    // Ramp the startup feedbacks as bitrate/4, /3, /2 and /1 on consecutive timer ticks, then keep
+    // refreshing the full target.
+    uint64_t bitrate = bitrate_;
+    if (remb_startup_ > 0) {
+        bitrate = bitrate_ / remb_startup_;
+        remb_startup_--;
+    }
+
+    // @see https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03#section-2.2
+    int min_len = 20 + 4;
+    char buf[kRtpPacketSize];
+    SrsBuffer stream(buf, sizeof(buf));
+    // Header, PSFB with FMT=15.
+    stream.write_1bytes(0x8F);
+    stream.write_1bytes(kPsFb);
+    stream.write_2bytes((min_len / 4) - 1);
+    // SSRC of packet sender and SSRC of media source, which is always 0.
+    stream.write_4bytes(ssrc);
+    stream.write_4bytes(0);
+    // Unique identifier, always REMB.
+    stream.write_1bytes('R');
+    stream.write_1bytes('E');
+    stream.write_1bytes('M');
+    stream.write_1bytes('B');
+    // Num SSRC, always 1.
+    stream.write_1bytes(1);
+    // Encode the bitrate as 6-bit exponent and 18-bit mantissa.
+    uint8_t exp = 0;
+    for (; exp < 32; exp++) {
+        if (bitrate <= ((uint64_t)0x3FFFF << exp)) {
+            break;
+        }
+    }
+    if (exp > 31) {
+        exp = 31;
+    }
+    uint32_t mantissa = (uint32_t)(bitrate >> exp);
+    stream.write_1bytes((uint8_t)((exp << 2) + ((mantissa >> 16) & 0x03)));
+    stream.write_1bytes((uint8_t)(mantissa >> 8));
+    stream.write_1bytes((uint8_t)(mantissa));
+    // SSRC feedback, the primary SSRC of the first accepted video m-line.
+    stream.write_4bytes(ssrc);
+
+    if ((err = receiver_->send_rtcp(stream.data(), stream.pos())) != srs_success) {
+        return srs_error_wrap(err, "rtcp remb send error(ssrc=%u, bitrate=%" PRIu64 ")", ssrc, bitrate);
     }
 
     return err;
@@ -1738,6 +1859,9 @@ srs_error_t SrsRtcPublishStream::do_on_rtp_plaintext(SrsRtpPacket *&pkt, SrsBuff
     if ((err = track->on_rtp(source_, pkt)) != srs_success) {
         return srs_error_wrap(err, "audio track, SSRC=%u, SEQ=%u", ssrc, pkt->header_.get_sequence());
     }
+
+    // [OpenSight fork] REMB is deliberately not sent from this path: the RTCP timer owns the startup ramp
+    // and the refresh, so the UDP receive coroutine never waits on a send or on the REMB mutex.
 
     // For NACK to handle packet, which also records it in the receive queue. When the circuit-breaker is at its
     // high or critical level, the track records the packet but asks for no loss.
@@ -3458,6 +3582,69 @@ bool srs_sdp_has_h265_profile(const SrsSdp &sdp, const string &profile)
     return false;
 }
 
+// [OpenSight fork] Keep the REMB feedback only when the publisher offers it and this video m-line is the
+// first accepted one, which is the track the sender actually feeds back to. A later video m-line never
+// stands alone as REMB-eligible, so the answer advertising always matches the feedback destination.
+static void srs_rtc_negotiate_remb_feedback(bool remb_for_video, const std::string &rtcp_fb, SrsCodecPayload *payload)
+{
+    if (remb_for_video && rtcp_fb == "goog-remb") {
+        payload->rtcp_fbs_.push_back(rtcp_fb);
+    }
+}
+
+// [OpenSight fork] Whether the SSRC is the repair member of a declared FID, FEC or FEC-FR group. The
+// groups name roles inside a pair; the first member is the source or primary, the second is auxiliary.
+static bool srs_rtc_is_auxiliary_ssrc(const SrsMediaDesc &desc, uint32_t ssrc)
+{
+    for (int i = 0; i < (int)desc.ssrc_groups_.size(); ++i) {
+        const SrsSSRCGroup &group = desc.ssrc_groups_.at(i);
+        if (group.ssrcs_.size() < 2) {
+            continue;
+        }
+        if (group.semantic_ != "FID" && group.semantic_ != "FEC" && group.semantic_ != "FEC-FR") {
+            continue;
+        }
+        if (group.ssrcs_.at(1) == ssrc) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// [OpenSight fork] Resolve the primary SSRC of a video m-line for REMB. Track descriptions are created in
+// a=ssrc line order, before the FID group is applied, so the first description may be the RTX SSRC when
+// the offer lists it first or when both SSRCs share one track id. FID groups name the roles inside each
+// pair, not a priority among multiple primaries, so walk the declared SSRCs in source order and take the
+// first real primary. Only when the primary is named solely by a FID group does the group supply it.
+// A zero result means the m-line has no known feedback destination.
+static uint32_t srs_rtc_video_primary_ssrc(const SrsMediaDesc &desc)
+{
+    for (int i = 0; i < (int)desc.ssrc_infos_.size(); ++i) {
+        uint32_t ssrc = desc.ssrc_infos_.at(i).ssrc_;
+        if (ssrc == 0 || srs_rtc_is_auxiliary_ssrc(desc, ssrc)) {
+            continue;
+        }
+
+        return ssrc;
+    }
+
+    // The primary may only be present in grouping, with no a=ssrc line of its own.
+    for (int i = 0; i < (int)desc.ssrc_groups_.size(); ++i) {
+        const SrsSSRCGroup &group = desc.ssrc_groups_.at(i);
+        if (group.semantic_ != "FID" || group.ssrcs_.size() < 2) {
+            continue;
+        }
+
+        uint32_t primary = group.ssrcs_.at(0);
+        if (primary != 0 && !srs_rtc_is_auxiliary_ssrc(desc, primary)) {
+            return primary;
+        }
+    }
+
+    return 0;
+}
+
 srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserConfig *ruc, SrsRtcSourceDescription *stream_desc)
 {
     srs_error_t err = srs_success;
@@ -3471,6 +3658,15 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
 
     bool nack_enabled = config_->get_rtc_nack_enabled(req->vhost_);
     bool twcc_enabled = config_->get_rtc_twcc_enabled(req->vhost_);
+    // [OpenSight fork] Resolve the per-vhost default once and snapshot it on the request, so the answer
+    // and the sender share one target and a config reload cannot change an in-flight session. A zero
+    // per-request value means no override; a zero vhost value means no default. Only an effective zero
+    // target disables the feedback.
+    req->vhost_bitrate_ = config_->get_rtc_bitrate(req->vhost_);
+    // [OpenSight fork] Resolve the feedback destination below, once, from the first accepted video
+    // m-line, and snapshot it for the sender.
+    req->remb_ssrc_ = 0;
+    bool remb_enabled = req->bitrate_ > 0 || req->vhost_bitrate_ > 0;
     // TODO: FIME: Should check packetization-mode=1 also.
     bool has_42e01f = srs_sdp_has_h264_profile(remote_sdp, "42e01f");
 
@@ -3482,6 +3678,16 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
 
         if (remote_media_desc.is_video())
             nn_any_video_parsed++;
+
+        // The sender feeds back to the first accepted video track only, so later m-lines must not
+        // advertise REMB even when they offer it.
+        const bool remb_for_video = remb_enabled && nn_any_video_parsed == 1;
+
+        // [OpenSight fork] Resolve the REMB destination once, from the first accepted video m-line's
+        // declared SSRC order, using FID only to identify each pair's repair member.
+        if (remote_media_desc.is_video() && nn_any_video_parsed == 1) {
+            req->remb_ssrc_ = srs_rtc_video_primary_ssrc(remote_media_desc);
+        }
 
         SrsUniquePtr<SrsRtcTrackDescription> track_desc(new SrsRtcTrackDescription());
 
@@ -3596,6 +3802,8 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
                     }
+                    // [OpenSight fork] Keep REMB only on the first video m-line, when offered and targeted.
+                    srs_rtc_negotiate_remb_feedback(remb_for_video, rtcp_fb, video_payload);
                 }
 
                 track_desc->type_ = "video";
@@ -3628,6 +3836,8 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
                     }
+                    // [OpenSight fork] Keep REMB only on the first video m-line, when offered and targeted.
+                    srs_rtc_negotiate_remb_feedback(remb_for_video, rtcp_fb, video_payload);
                 }
 
                 track_desc->type_ = "video";
@@ -3662,6 +3872,8 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
                     }
+                    // [OpenSight fork] Keep REMB only on the first video m-line, when offered and targeted.
+                    srs_rtc_negotiate_remb_feedback(remb_for_video, rtcp_fb, video_payload);
                 }
 
                 track_desc->type_ = "video";
@@ -3714,6 +3926,8 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
                                 video_payload->rtcp_fbs_.push_back(rtcp_fb);
                             }
                         }
+                        // [OpenSight fork] Keep REMB only on the first video m-line, when offered and targeted.
+                        srs_rtc_negotiate_remb_feedback(remb_for_video, rtcp_fb, video_payload);
                     }
 
                     track_desc->type_ = "video";
@@ -3751,6 +3965,9 @@ srs_error_t SrsRtcPublisherNegotiator::negotiate_publish_capability(SrsRtcUserCo
                             video_payload->rtcp_fbs_.push_back(rtcp_fb);
                         }
                     }
+
+                    // [OpenSight fork] Keep REMB only on the first video m-line, when offered and targeted.
+                    srs_rtc_negotiate_remb_feedback(remb_for_video, rtcp_fb, video_payload);
                 }
 
                 track_desc->type_ = "video";

@@ -401,6 +401,8 @@ public:
     virtual bool is_sender_started() = 0;
     virtual srs_error_t send_rtcp_rr() = 0;
     virtual srs_error_t send_rtcp_xr_rrtr() = 0;
+    // [OpenSight fork] Send a REMB target to the video publisher, if negotiated and configured.
+    virtual srs_error_t send_rtcp_remb() = 0;
 
 public:
     virtual bool is_sender_twcc_enabled() = 0;
@@ -566,6 +568,12 @@ SRS_DECLARE_PRIVATE: // clang-format on
     bool nack_enabled_;
     bool nack_no_copy_;
     bool twcc_enabled_;
+    // [OpenSight fork] The effective REMB target in bps, 0 means no feedback target.
+    uint64_t bitrate_;
+    // [OpenSight fork] The number of startup REMB feedbacks still ramping, 0 means full target.
+    int remb_startup_;
+    // [OpenSight fork] Serialize the timer-driven REMB feedback with stop() and destruction.
+    srs_mutex_t lock_remb_;
 
 // clang-format off
 SRS_DECLARE_PRIVATE: // clang-format on
@@ -625,6 +633,8 @@ SRS_DECLARE_PRIVATE: // clang-format on
     bool is_sender_twcc_enabled();
     srs_error_t send_rtcp_rr();
     srs_error_t send_rtcp_xr_rrtr();
+    // [OpenSight fork] Send a REMB target to the first video SSRC.
+    srs_error_t send_rtcp_remb();
 
 public:
     srs_error_t on_rtp_cipher(char *buf, int nb_buf);

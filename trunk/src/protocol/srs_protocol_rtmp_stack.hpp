@@ -468,6 +468,17 @@ public:
     // used for edge traverse to origin authentication,
     // @see https://github.com/ossrs/srs/issues/104
     SrsAmf0Object *args_;
+    // [OpenSight fork] The WebRTC publishing REMB target in bps requested by the legacy publish
+    // API, where 0 means no per-request override and the per-vhost default applies.
+    uint64_t bitrate_;
+    // [OpenSight fork] The per-vhost default WebRTC publishing REMB target in bps, resolved once by
+    // the publisher negotiator and snapshotted here so the answer and the sender share one value
+    // across a config reload. Zero means the vhost supplies no default target.
+    uint64_t vhost_bitrate_;
+    // [OpenSight fork] The primary video SSRC of the first accepted video m-line, resolved once by the
+    // publisher negotiator from the FID group and snapshotted here so the REMB feedback targets the
+    // primary even when the offer lists its RTX SSRC first. Zero means no known destination.
+    uint32_t remb_ssrc_;
 
 public:
     // The protocol of client:

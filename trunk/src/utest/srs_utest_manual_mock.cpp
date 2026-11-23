@@ -554,6 +554,9 @@ MockRtcAsyncCallRequest::~MockRtcAsyncCallRequest()
 ISrsRequest *MockRtcAsyncCallRequest::copy()
 {
     MockRtcAsyncCallRequest *cp = new MockRtcAsyncCallRequest(vhost_, app_, stream_);
+    cp->bitrate_ = bitrate_;
+    cp->vhost_bitrate_ = vhost_bitrate_;
+    cp->remb_ssrc_ = remb_ssrc_;
     return cp;
 }
 
@@ -913,6 +916,8 @@ void MockRtcPacketReceiver::check_send_nacks(SrsRtpNackForReceiver *nack, uint32
 srs_error_t MockRtcPacketReceiver::send_rtcp(char *data, int nb_data)
 {
     send_rtcp_count_++;
+    // [OpenSight fork] Keep the payload so tests can verify the actual outgoing RTCP feedback.
+    sent_rtcp_packets_.push_back(std::string(data, nb_data));
     return send_rtcp_error_;
 }
 
@@ -2120,6 +2125,9 @@ ISrsRequest *MockRequest::copy()
     req->protocol_ = protocol_;
     req->objectEncoding_ = objectEncoding_;
     req->ip_ = ip_;
+    req->bitrate_ = bitrate_;
+    req->vhost_bitrate_ = vhost_bitrate_;
+    req->remb_ssrc_ = remb_ssrc_;
     return req;
 }
 

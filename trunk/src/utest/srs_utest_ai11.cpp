@@ -3530,9 +3530,11 @@ MockRtcRtcpSender::MockRtcRtcpSender()
     send_rtcp_rr_error_ = srs_success;
     send_rtcp_xr_rrtr_error_ = srs_success;
     send_periodic_twcc_error_ = srs_success;
+    send_rtcp_remb_error_ = srs_success;
     send_rtcp_rr_count_ = 0;
     send_rtcp_xr_rrtr_count_ = 0;
     send_periodic_twcc_count_ = 0;
+    send_rtcp_remb_count_ = 0;
 }
 
 MockRtcRtcpSender::~MockRtcRtcpSender()
@@ -3540,6 +3542,7 @@ MockRtcRtcpSender::~MockRtcRtcpSender()
     srs_freep(send_rtcp_rr_error_);
     srs_freep(send_rtcp_xr_rrtr_error_);
     srs_freep(send_periodic_twcc_error_);
+    srs_freep(send_rtcp_remb_error_);
 }
 
 bool MockRtcRtcpSender::is_sender_started()
@@ -3557,6 +3560,12 @@ srs_error_t MockRtcRtcpSender::send_rtcp_xr_rrtr()
 {
     send_rtcp_xr_rrtr_count_++;
     return srs_error_copy(send_rtcp_xr_rrtr_error_);
+}
+
+srs_error_t MockRtcRtcpSender::send_rtcp_remb()
+{
+    send_rtcp_remb_count_++;
+    return srs_error_copy(send_rtcp_remb_error_);
 }
 
 bool MockRtcRtcpSender::is_sender_twcc_enabled()
@@ -3592,6 +3601,12 @@ void MockRtcRtcpSender::set_send_rtcp_xr_rrtr_error(srs_error_t err)
     send_rtcp_xr_rrtr_error_ = srs_error_copy(err);
 }
 
+void MockRtcRtcpSender::set_send_rtcp_remb_error(srs_error_t err)
+{
+    srs_freep(send_rtcp_remb_error_);
+    send_rtcp_remb_error_ = srs_error_copy(err);
+}
+
 void MockRtcRtcpSender::set_send_periodic_twcc_error(srs_error_t err)
 {
     srs_freep(send_periodic_twcc_error_);
@@ -3605,12 +3620,15 @@ void MockRtcRtcpSender::reset()
     srs_freep(send_rtcp_rr_error_);
     srs_freep(send_rtcp_xr_rrtr_error_);
     srs_freep(send_periodic_twcc_error_);
+    srs_freep(send_rtcp_remb_error_);
     send_rtcp_rr_error_ = srs_success;
     send_rtcp_xr_rrtr_error_ = srs_success;
     send_periodic_twcc_error_ = srs_success;
+    send_rtcp_remb_error_ = srs_success;
     send_rtcp_rr_count_ = 0;
     send_rtcp_xr_rrtr_count_ = 0;
     send_periodic_twcc_count_ = 0;
+    send_rtcp_remb_count_ = 0;
 }
 
 VOID TEST(SrsRtcPublishRtcpTimerTest, OnTimer)
@@ -3633,6 +3651,8 @@ VOID TEST(SrsRtcPublishRtcpTimerTest, OnTimer)
         // Verify both RTCP methods were called
         EXPECT_EQ(1, mock_sender->send_rtcp_rr_count_);
         EXPECT_EQ(1, mock_sender->send_rtcp_xr_rrtr_count_);
+        // The periodic REMB refresh runs on the same timer.
+        EXPECT_EQ(1, mock_sender->send_rtcp_remb_count_);
     }
 
     // Test 2: Sender not started - should return success but not call RTCP methods
@@ -3645,6 +3665,7 @@ VOID TEST(SrsRtcPublishRtcpTimerTest, OnTimer)
         // Verify RTCP methods were not called
         EXPECT_EQ(0, mock_sender->send_rtcp_rr_count_);
         EXPECT_EQ(0, mock_sender->send_rtcp_xr_rrtr_count_);
+        EXPECT_EQ(0, mock_sender->send_rtcp_remb_count_);
     }
 
     // Test 3: send_rtcp_rr fails - should continue and call send_rtcp_xr_rrtr

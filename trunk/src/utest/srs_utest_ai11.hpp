@@ -392,9 +392,11 @@ public:
     srs_error_t send_rtcp_rr_error_;
     srs_error_t send_rtcp_xr_rrtr_error_;
     srs_error_t send_periodic_twcc_error_;
+    srs_error_t send_rtcp_remb_error_;
     int send_rtcp_rr_count_;
     int send_rtcp_xr_rrtr_count_;
     int send_periodic_twcc_count_;
+    int send_rtcp_remb_count_;
 
 public:
     MockRtcRtcpSender();
@@ -404,6 +406,7 @@ public:
     virtual bool is_sender_started();
     virtual srs_error_t send_rtcp_rr();
     virtual srs_error_t send_rtcp_xr_rrtr();
+    virtual srs_error_t send_rtcp_remb();
     virtual bool is_sender_twcc_enabled();
     virtual srs_error_t send_periodic_twcc();
 
@@ -412,6 +415,7 @@ public:
     void set_sender_twcc_enabled(bool enabled);
     void set_send_rtcp_rr_error(srs_error_t err);
     void set_send_rtcp_xr_rrtr_error(srs_error_t err);
+    void set_send_rtcp_remb_error(srs_error_t err);
     void set_send_periodic_twcc_error(srs_error_t err);
     void reset();
 };
