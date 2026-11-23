@@ -503,6 +503,7 @@ public:
     virtual bool get_debug_srs_upnode(std::string vhost) { return true; }
     virtual int get_out_ack_size(std::string vhost) { return 2500000; }
     virtual int get_in_ack_size(std::string vhost) { return 2500000; }
+    virtual int get_bw_limit_kbps(std::string vhost) { return 0; }
     virtual int get_chunk_size(std::string vhost) { return 60000; }
     virtual bool get_gop_cache(std::string vhost) { return true; }
     virtual int get_gop_cache_max_frames(std::string vhost) { return 2500; }

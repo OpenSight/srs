@@ -5626,3 +5626,63 @@ VOID TEST(KernelUtilityTest, SecurityAllowRuleWithPrefixLengthOver32_RuleMatches
     sec.config_ = NULL;
 }
 
+// The per-vhost publisher bandwidth limit is a supported vhost directive, so a
+// v6 OpenSight configuration that carries it must validate on v7.
+VOID TEST(BwLimitConfigTest, AcceptDirective)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost ossrs.net{bw_limit_kbps 1000;}"));
+}
+
+// Omitted or zero means the per-vhost publisher bandwidth limit is disabled.
+VOID TEST(BwLimitConfigTest, DefaultDisabled)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost ossrs.net;"));
+    EXPECT_EQ(0, conf.get_bw_limit_kbps("ossrs.net"));
+    EXPECT_EQ(0, conf.get_bw_limit_kbps("__defaultVhost__"));
+
+    MockSrsConfig zero;
+    HELPER_ASSERT_SUCCESS(zero.mock_parse(_MIN_OK_CONF "vhost ossrs.net{bw_limit_kbps 0;}"));
+    EXPECT_EQ(0, zero.get_bw_limit_kbps("ossrs.net"));
+}
+
+// The limit is in kbps, as v6 used it, including the largest value the getter can return.
+VOID TEST(BwLimitConfigTest, AcceptValues)
+{
+    srs_error_t err = srs_success;
+
+    MockSrsConfig conf;
+    HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost ossrs.net{bw_limit_kbps 1000;}"));
+    EXPECT_EQ(1000, conf.get_bw_limit_kbps("ossrs.net"));
+
+    MockSrsConfig max;
+    HELPER_ASSERT_SUCCESS(max.mock_parse(_MIN_OK_CONF "vhost ossrs.net{bw_limit_kbps 2147483647;}"));
+    EXPECT_EQ(2147483647, max.get_bw_limit_kbps("ossrs.net"));
+}
+
+// An explicit limit must be exactly one non-negative decimal integer in the range
+// of the getter, so a misspelt, negative, extra-argument or overflowing value is
+// refused at startup instead of silently disabling or mangling the policy.
+VOID TEST(BwLimitConfigTest, RejectInvalidValues)
+{
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps;}", "invalid vhost ossrs.net bw_limit_kbps");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps abc;}", "invalid vhost ossrs.net bw_limit_kbps=abc");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 100k;}", "invalid vhost ossrs.net bw_limit_kbps=100k");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 1.5;}", "invalid vhost ossrs.net bw_limit_kbps=1.5");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 1 2;}", "invalid vhost ossrs.net bw_limit_kbps");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps -1;}", "invalid vhost ossrs.net bw_limit_kbps=-1");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 2147483648;}", "invalid vhost ossrs.net bw_limit_kbps=2147483648");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 999999999999999999999;}", "invalid vhost ossrs.net bw_limit_kbps=999999999999999999999");
+}
+
+// Repeating the directive is ambiguous, so it is refused rather than letting the
+// first value silently win.
+VOID TEST(BwLimitConfigTest, RejectRepeatedDirective)
+{
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 100; bw_limit_kbps 200;}", "duplicate vhost.bw_limit_kbps of ossrs.net");
+}

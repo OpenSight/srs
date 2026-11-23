@@ -212,6 +212,8 @@ SRS_DECLARE_PRIVATE: // clang-format on
     srs_utime_t publish_1stpkt_timeout_;
     // The publish normal packet timeout in srs_utime_t
     srs_utime_t publish_normal_timeout_;
+    // The publisher bandwidth limit in kbps, 0 to disable.
+    int bw_limit_kbps_;
     // Whether enable the tcp_nodelay.
     bool tcp_nodelay_;
     // About the rtmp client.

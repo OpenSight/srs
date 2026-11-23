@@ -430,6 +430,7 @@ public:
     virtual bool get_debug_srs_upnode(std::string vhost) = 0;
     virtual int get_out_ack_size(std::string vhost) = 0;
     virtual int get_in_ack_size(std::string vhost) = 0;
+    virtual int get_bw_limit_kbps(std::string vhost) = 0;
     virtual int get_chunk_size(std::string vhost) = 0;
     virtual bool get_gop_cache(std::string vhost) = 0;
     virtual int get_gop_cache_max_frames(std::string vhost) = 0;
@@ -993,6 +994,9 @@ public:
     virtual int get_in_ack_size(std::string vhost);
     // Get the output default ack size, to notify the peer to send acknowledge to server.
     virtual int get_out_ack_size(std::string vhost);
+    // Get the publisher bandwidth limit in kbps for a vhost.
+    // @remark default 0, which disables the limit.
+    virtual int get_bw_limit_kbps(std::string vhost);
     // Get the chunk size of vhost.
     // @param vhost, the vhost to get the chunk size. use global if not specified.
     //       empty string to get the global.
