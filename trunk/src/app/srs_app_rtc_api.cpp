@@ -53,7 +53,8 @@ uint64_t srs_rtc_publish_resolve_bitrate(SrsJsonObject *req, const string &query
         if (valid && v > 0 && v <= SRS_RTC_PUBLISH_BITRATE_MAX) {
             bitrate = v;
         } else if (!valid || v > SRS_RTC_PUBLISH_BITRATE_MAX) {
-            srs_warn("RTC publish: ignore invalid query bitrate=%s", query.c_str());
+            // Do not reflect the arbitrary query string; the length is enough to correlate the request.
+            srs_warn("RTC publish: ignore invalid query bitrate, length=%d", (int)query.length());
         }
     }
 

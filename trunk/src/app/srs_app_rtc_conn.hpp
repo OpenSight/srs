@@ -572,7 +572,7 @@ SRS_DECLARE_PRIVATE: // clang-format on
     uint64_t bitrate_;
     // [OpenSight fork] The number of startup REMB feedbacks still ramping, 0 means full target.
     int remb_startup_;
-    // [OpenSight fork] Serialize the startup and periodic REMB feedbacks.
+    // [OpenSight fork] Serialize the timer-driven REMB feedback with stop() and destruction.
     srs_mutex_t lock_remb_;
 
 // clang-format off

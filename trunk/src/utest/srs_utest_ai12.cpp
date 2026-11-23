@@ -1364,6 +1364,7 @@ ISrsRequest *MockRtcConnectionRequest::copy()
     req->objectEncoding_ = objectEncoding_;
     req->ip_ = ip_;
     req->bitrate_ = bitrate_;
+    req->vhost_bitrate_ = vhost_bitrate_;
     return req;
 }
 
@@ -1383,6 +1384,7 @@ void MockRtcConnectionRequest::update_auth(ISrsRequest *req)
         swfUrl_ = req->swfUrl_;
         tcUrl_ = req->tcUrl_;
         bitrate_ = req->bitrate_;
+        vhost_bitrate_ = req->vhost_bitrate_;
     }
 }
 
@@ -2514,6 +2516,73 @@ static std::string srs_test_publisher_offer(bool video, bool goog_remb)
     return sdp;
 }
 
+// [OpenSight fork] Build a publisher offer with two video m-lines and one audio m-line, where each video
+// m-line may independently offer goog-remb. Used to verify that only the first accepted video m-line, which
+// is the REMB feedback destination, advertises the feedback.
+static std::string srs_test_publisher_offer_two_video(bool first_goog_remb, bool second_goog_remb)
+{
+    std::string sdp =
+        "v=0\r\n"
+        "o=- rtc 4158491451 0 IN IP4 127.0.0.1\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE video0 video1 audio\r\n"
+        "a=msid-semantic:WMS *\r\n"
+        "a=ice-options:ice2,trickle\r\n"
+        "a=fingerprint:sha-256 28:37:F7:18:77:FC:46:33:6F:B2:0F:12:83:C2:BF:5C:61:5E:96:EB:4B:B9:97:81:92:7C:82:10:97:B8:8E:60\r\n";
+
+    const bool rembs[] = {first_goog_remb, second_goog_remb};
+    for (int i = 0; i < 2; i++) {
+        const char *mid = i == 0 ? "video0" : "video1";
+        uint32_t ssrc = i == 0 ? 42 : 44;
+
+        sdp += "m=video 56144 UDP/TLS/RTP/SAVPF 96\r\n"
+               "c=IN IP4 172.24.64.1\r\n"
+               "a=mid:";
+        sdp += mid;
+        sdp += "\r\n"
+               "a=sendonly\r\n"
+               "a=ssrc:";
+        sdp += srs_fmt_sprintf("%u", ssrc);
+        sdp += " cname:";
+        sdp += mid;
+        sdp += "-send\r\n"
+               "a=ssrc:";
+        sdp += srs_fmt_sprintf("%u", ssrc);
+        sdp += " msid:stream ";
+        sdp += mid;
+        sdp += "\r\n"
+               "a=rtcp-mux\r\n"
+               "a=rtpmap:96 H264/90000\r\n"
+               "a=rtcp-fb:96 nack\r\n"
+               "a=rtcp-fb:96 nack pli\r\n"
+               "a=rtcp-fb:96 transport-cc\r\n";
+        if (rembs[i]) {
+            sdp += "a=rtcp-fb:96 goog-remb\r\n";
+        }
+        sdp += "a=fmtp:96 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1\r\n"
+               "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n"
+               "a=setup:actpass\r\n"
+               "a=ice-ufrag:fEw/\r\n"
+               "a=ice-pwd:jBua8YGWQKc/Vn6Y9EZ9+0\r\n";
+    }
+
+    sdp +=
+        "m=audio 56144 UDP/TLS/RTP/SAVPF 111\r\n"
+        "c=IN IP4 172.24.64.1\r\n"
+        "a=mid:audio\r\n"
+        "a=sendonly\r\n"
+        "a=ssrc:43 cname:audio-send\r\n"
+        "a=ssrc:43 msid:stream audio\r\n"
+        "a=rtcp-mux\r\n"
+        "a=rtpmap:111 opus/48000/2\r\n"
+        "a=setup:actpass\r\n"
+        "a=ice-ufrag:fEw/\r\n"
+        "a=ice-pwd:jBua8YGWQKc/Vn6Y9EZ9+0\r\n";
+
+    return sdp;
+}
+
 // [OpenSight fork] Whether the first negotiated video track keeps the feedback.
 static bool srs_test_video_rtcp_fb_has(SrsRtcSourceDescription *desc, const std::string &fb)
 {
@@ -2526,6 +2595,51 @@ static bool srs_test_video_rtcp_fb_has(SrsRtcSourceDescription *desc, const std:
         if (fbs[i] == fb) {
             return true;
         }
+    }
+
+    return false;
+}
+
+// [OpenSight fork] Whether the video track at the given index keeps the feedback.
+static bool srs_test_video_rtcp_fb_has_at(SrsRtcSourceDescription *desc, int index, const std::string &fb)
+{
+    if (index < 0 || index >= (int)desc->video_track_descs_.size() || !desc->video_track_descs_[index]->media_) {
+        return false;
+    }
+
+    std::vector<std::string> &fbs = desc->video_track_descs_[index]->media_->rtcp_fbs_;
+    for (size_t i = 0; i < fbs.size(); i++) {
+        if (fbs[i] == fb) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// [OpenSight fork] Whether the video m-line at the given index in the generated answer advertises the feedback.
+static bool srs_test_answer_video_fb_has(const SrsSdp &answer, int index, const std::string &fb)
+{
+    int nn_video = 0;
+    for (int i = 0; i < (int)answer.media_descs_.size(); i++) {
+        const SrsMediaDesc &media = answer.media_descs_.at(i);
+        if (!media.is_video()) {
+            continue;
+        }
+        if (nn_video++ != index) {
+            continue;
+        }
+        if (media.payload_types_.empty()) {
+            return false;
+        }
+
+        const std::vector<std::string> &fbs = media.payload_types_.at(0).rtcp_fb_;
+        for (size_t j = 0; j < fbs.size(); j++) {
+            if (fbs[j] == fb) {
+                return true;
+            }
+        }
+        return false;
     }
 
     return false;
@@ -2559,6 +2673,48 @@ static SrsRtcSourceDescription *srs_test_negotiate_publisher(bool video, bool go
 
     SrsRtcSourceDescription *desc = new SrsRtcSourceDescription();
     if ((err = negotiator->negotiate_publish_capability(ruc.get(), desc)) != srs_success) {
+        srs_freep(desc);
+        return NULL;
+    }
+
+    return desc;
+}
+
+// [OpenSight fork] Negotiate the given publisher offer and also generate the answer SDP, so tests can
+// assert the advertised feedback per video m-line through the public negotiation seam.
+static SrsRtcSourceDescription *srs_test_negotiate_publisher_offer(const std::string &offer, uint64_t cfg_bitrate, uint64_t req_bitrate, SrsSdp &answer, srs_error_t &err)
+{
+    err = srs_success;
+
+    SrsUniquePtr<MockAppConfig> cfg(new MockAppConfig());
+    cfg->set_rtc_bitrate(cfg_bitrate);
+
+    SrsUniquePtr<SrsRtcPublisherNegotiator> negotiator(new SrsRtcPublisherNegotiator());
+    negotiator->config_ = cfg.get();
+
+    SrsUniquePtr<MockRtcConnectionRequest> mock_request(new MockRtcConnectionRequest("test.vhost", "live", "stream1"));
+
+    SrsUniquePtr<SrsRtcUserConfig> ruc(new SrsRtcUserConfig());
+    srs_freep(ruc->req_);
+    ruc->req_ = mock_request->copy();
+    ruc->req_->bitrate_ = req_bitrate;
+    ruc->publish_ = true;
+    ruc->dtls_ = true;
+    ruc->srtp_ = true;
+    ruc->audio_before_video_ = false;
+    ruc->remote_sdp_str_ = offer;
+
+    if ((err = ruc->remote_sdp_.parse(ruc->remote_sdp_str_)) != srs_success) {
+        return NULL;
+    }
+
+    SrsRtcSourceDescription *desc = new SrsRtcSourceDescription();
+    if ((err = negotiator->negotiate_publish_capability(ruc.get(), desc)) != srs_success) {
+        srs_freep(desc);
+        return NULL;
+    }
+
+    if ((err = negotiator->generate_publish_local_sdp(ruc->req_, answer, desc, true, false)) != srs_success) {
         srs_freep(desc);
         return NULL;
     }
@@ -2616,6 +2772,121 @@ VOID TEST(SrsRtcPublisherNegotiatorTest, NegotiateRembOnlyWhenTargetedAndOffered
         ASSERT_TRUE(desc.get() != NULL);
         EXPECT_TRUE(desc->video_track_descs_.empty());
         EXPECT_TRUE(desc->audio_track_desc_ != NULL);
+    }
+}
+
+// [OpenSight fork] The answer advertises REMB only on the first video m-line, which is the first accepted
+// video track and the feedback destination. A later video m-line never stands alone as REMB-eligible.
+VOID TEST(SrsRtcPublisherNegotiatorTest, NegotiateRembOnlyOnFirstVideoMline)
+{
+    srs_error_t err;
+
+    // The first video m-line does not offer REMB and the second does: neither advertises it, so the
+    // sender has no eligible feedback destination and stays silent.
+    if (true) {
+        SrsSdp answer;
+        SrsUniquePtr<SrsRtcSourceDescription> desc(srs_test_negotiate_publisher_offer(
+            srs_test_publisher_offer_two_video(false, true), 1000000, 0, answer, err));
+        HELPER_EXPECT_SUCCESS(err);
+        ASSERT_TRUE(desc.get() != NULL);
+        ASSERT_EQ(2, (int)desc->video_track_descs_.size());
+        EXPECT_FALSE(srs_test_video_rtcp_fb_has_at(desc.get(), 0, "goog-remb"));
+        EXPECT_FALSE(srs_test_video_rtcp_fb_has_at(desc.get(), 1, "goog-remb"));
+        EXPECT_FALSE(srs_test_answer_video_fb_has(answer, 0, "goog-remb"));
+        EXPECT_FALSE(srs_test_answer_video_fb_has(answer, 1, "goog-remb"));
+        // NACK and TWCC remain negotiated on both video m-lines.
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 0, "nack"));
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 1, "nack"));
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 0, "transport-cc"));
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 1, "transport-cc"));
+    }
+
+    // Both video m-lines offer REMB: only the first advertises it.
+    if (true) {
+        SrsSdp answer;
+        SrsUniquePtr<SrsRtcSourceDescription> desc(srs_test_negotiate_publisher_offer(
+            srs_test_publisher_offer_two_video(true, true), 1000000, 0, answer, err));
+        HELPER_EXPECT_SUCCESS(err);
+        ASSERT_TRUE(desc.get() != NULL);
+        ASSERT_EQ(2, (int)desc->video_track_descs_.size());
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 0, "goog-remb"));
+        EXPECT_FALSE(srs_test_video_rtcp_fb_has_at(desc.get(), 1, "goog-remb"));
+        EXPECT_TRUE(srs_test_answer_video_fb_has(answer, 0, "goog-remb"));
+        EXPECT_FALSE(srs_test_answer_video_fb_has(answer, 1, "goog-remb"));
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 0, "transport-cc"));
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has_at(desc.get(), 1, "transport-cc"));
+    }
+
+    // Without any target, the first m-line does not advertise it either.
+    if (true) {
+        SrsSdp answer;
+        SrsUniquePtr<SrsRtcSourceDescription> desc(srs_test_negotiate_publisher_offer(
+            srs_test_publisher_offer_two_video(true, true), 0, 0, answer, err));
+        HELPER_EXPECT_SUCCESS(err);
+        ASSERT_TRUE(desc.get() != NULL);
+        EXPECT_FALSE(srs_test_video_rtcp_fb_has_at(desc.get(), 0, "goog-remb"));
+        EXPECT_FALSE(srs_test_video_rtcp_fb_has_at(desc.get(), 1, "goog-remb"));
+        EXPECT_FALSE(srs_test_answer_video_fb_has(answer, 0, "goog-remb"));
+        EXPECT_FALSE(srs_test_answer_video_fb_has(answer, 1, "goog-remb"));
+    }
+}
+
+// [OpenSight fork] The negotiator resolves the per-vhost default once and snapshots it on the request, so
+// the answer and the sender share one value.
+VOID TEST(SrsRtcPublisherNegotiatorTest, SnapshotVhostBitrateOnRequest)
+{
+    srs_error_t err;
+
+    if (true) {
+        MockAppConfig cfg;
+        cfg.set_rtc_bitrate(1000000);
+
+        SrsRtcPublisherNegotiator negotiator;
+        negotiator.config_ = &cfg;
+
+        SrsRtcUserConfig ruc;
+        ruc.req_->vhost_ = "test.vhost";
+        ruc.req_->app_ = "live";
+        ruc.req_->stream_ = "stream1";
+        ruc.req_->bitrate_ = 0;
+        ruc.publish_ = true;
+        ruc.dtls_ = true;
+        ruc.srtp_ = true;
+        ruc.audio_before_video_ = false;
+        ruc.remote_sdp_str_ = srs_test_publisher_offer(true, true);
+
+        HELPER_EXPECT_SUCCESS(ruc.remote_sdp_.parse(ruc.remote_sdp_str_));
+
+        SrsUniquePtr<SrsRtcSourceDescription> desc(new SrsRtcSourceDescription());
+        HELPER_EXPECT_SUCCESS(negotiator.negotiate_publish_capability(&ruc, desc.get()));
+        EXPECT_EQ(1000000, ruc.req_->vhost_bitrate_);
+        EXPECT_TRUE(srs_test_video_rtcp_fb_has(desc.get(), "goog-remb"));
+    }
+
+    if (true) {
+        MockAppConfig cfg;
+        cfg.set_rtc_bitrate(0);
+
+        SrsRtcPublisherNegotiator negotiator;
+        negotiator.config_ = &cfg;
+
+        SrsRtcUserConfig ruc;
+        ruc.req_->vhost_ = "test.vhost";
+        ruc.req_->app_ = "live";
+        ruc.req_->stream_ = "stream1";
+        ruc.req_->bitrate_ = 0;
+        ruc.publish_ = true;
+        ruc.dtls_ = true;
+        ruc.srtp_ = true;
+        ruc.audio_before_video_ = false;
+        ruc.remote_sdp_str_ = srs_test_publisher_offer(true, true);
+
+        HELPER_EXPECT_SUCCESS(ruc.remote_sdp_.parse(ruc.remote_sdp_str_));
+
+        SrsUniquePtr<SrsRtcSourceDescription> desc(new SrsRtcSourceDescription());
+        HELPER_EXPECT_SUCCESS(negotiator.negotiate_publish_capability(&ruc, desc.get()));
+        EXPECT_EQ(0, ruc.req_->vhost_bitrate_);
+        EXPECT_FALSE(srs_test_video_rtcp_fb_has(desc.get(), "goog-remb"));
     }
 }
 
