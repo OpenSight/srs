@@ -7,6 +7,7 @@
 #include <srs_app_config.hpp>
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2208,7 +2209,7 @@ srs_error_t SrsConfig::check_normal_config()
         for (int i = 0; vhost && i < (int)vhost->directives_.size(); i++) {
             SrsConfDirective *conf = vhost->at(i);
             string n = conf->name_;
-            if (n != "enabled" && n != "chunk_size" && n != "min_latency" && n != "tcp_nodelay" && n != "dvr" && n != "ingest" && n != "hls" && n != "http_hooks" && n != "refer" && n != "forward" && n != "transcode" && n != "bandcheck" && n != "play" && n != "publish" && n != "cluster" && n != "security" && n != "http_remux" && n != "dash" && n != "http_static" && n != "hds" && n != "exec" && n != "in_ack_size" && n != "out_ack_size" && n != "rtc" && n != "srt" && n != "rtsp") {
+            if (n != "enabled" && n != "chunk_size" && n != "min_latency" && n != "tcp_nodelay" && n != "dvr" && n != "ingest" && n != "hls" && n != "http_hooks" && n != "refer" && n != "forward" && n != "transcode" && n != "bandcheck" && n != "play" && n != "publish" && n != "cluster" && n != "security" && n != "http_remux" && n != "dash" && n != "http_static" && n != "hds" && n != "exec" && n != "in_ack_size" && n != "out_ack_size" && n != "bw_limit_kbps" && n != "rtc" && n != "srt" && n != "rtsp") {
                 return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "illegal vhost.%s", n.c_str());
             }
             // for each sub directives of vhost.
@@ -2353,6 +2354,38 @@ srs_error_t SrsConfig::check_normal_config()
                         return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "illegal vhost.rtsp.%s of %s", m.c_str(), vhost->arg0().c_str());
                     }
                 }
+            }
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////
+    // check publisher bandwidth limit.
+    ////////////////////////////////////////////////////////////////////////
+    for (int n = 0; n < (int)vhosts.size(); n++) {
+        SrsConfDirective *vhost = vhosts[n];
+        string vhost_name = vhost->arg0();
+        int bw_limit_count = 0;
+
+        for (int i = 0; vhost && i < (int)vhost->directives_.size(); i++) {
+            SrsConfDirective *conf = vhost->at(i);
+            if (conf->name_ != "bw_limit_kbps") {
+                continue;
+            }
+
+            if (++bw_limit_count > 1) {
+                return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "duplicate vhost.bw_limit_kbps of %s", vhost_name.c_str());
+            }
+            if (conf->args_.size() != 1 || !conf->directives_.empty()) {
+                return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "invalid vhost %s bw_limit_kbps, should be one non-negative integer without a block", vhost_name.c_str());
+            }
+
+            string value = conf->arg0();
+            char *end = NULL;
+            errno = 0;
+            long limit = ::strtol(value.c_str(), &end, 10);
+            if (errno == ERANGE || end == value.c_str() || *end != '\0' || limit < 0 || limit > INT_MAX) {
+                return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "invalid vhost %s bw_limit_kbps=%s, should be a non-negative integer no more than %d",
+                                     vhost_name.c_str(), value.c_str(), INT_MAX);
             }
         }
     }
@@ -4518,6 +4551,27 @@ int SrsConfig::get_out_ack_size(string vhost)
     }
 
     conf = conf->get("out_ack_size");
+    if (!conf || conf->arg0().empty()) {
+        return DEFAULT;
+    }
+
+    return ::atoi(conf->arg0().c_str());
+}
+
+int SrsConfig::get_bw_limit_kbps(string vhost)
+{
+    static int DEFAULT = 0;
+
+    if (vhost.empty()) {
+        return DEFAULT;
+    }
+
+    SrsConfDirective *conf = get_vhost(vhost);
+    if (!conf) {
+        return DEFAULT;
+    }
+
+    conf = conf->get("bw_limit_kbps");
     if (!conf || conf->arg0().empty()) {
         return DEFAULT;
     }

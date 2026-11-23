@@ -208,6 +208,7 @@ By default, transmuxing between sources is disabled. You need to enable it in th
 - **Transcode** — SRS uses FFmpeg to transcode streams, especially video and audio to different codecs and sizes. v1.0, 2014-04
 - **DVR** — SRS supports recording streams to files. You can use these files as VOD (Video on Demand). You can also use FFmpeg to pull streams from SRS and DVR to file. Besides this, HLS is in fact also a DVR feature. Since v1.0, 2014-04
 - **Security** — SRS supports multiple access-control mechanisms: referer-based hotlink protection (`refer`), IP allow/deny rules (`security`), and HTTP callback for external authentication and verification. SRS does not provide a built-in username/password user management system; authentication is typically implemented by external logic such as HTTP callback or tokens. IP allow/deny rules were added in v2.0, 2015-01
+- **Publisher Bandwidth Limit (OpenSight fork)** — A per-vhost `bw_limit_kbps` caps the receive rate of each RTMP publishing connection in kbps, using the existing 30-second receive-rate sample; omitted or zero disables it. Migrated from the OpenSight v6 fork to SRS v7; not an upstream SRS feature. v7.0, 2026-11
 
 ## Vision
 
