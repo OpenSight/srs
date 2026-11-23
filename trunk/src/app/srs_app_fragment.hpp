@@ -69,6 +69,8 @@ public:
     virtual ~SrsFragment();
 
 public:
+    // Sanitize a DTS in milliseconds, resetting a negative or overflowing value to zero.
+    static int64_t sanitize_dts(int64_t dts);
     // Append a frame with dts into fragment.
     // @dts The dts of frame in ms.
     virtual void append(int64_t dts);

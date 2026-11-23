@@ -18,6 +18,7 @@
 #include <srs_kernel_mp4.hpp>
 #include <srs_kernel_packet.hpp>
 #include <srs_kernel_rtc_rtcp.hpp>
+#include <srs_kernel_ts.hpp>
 #include <srs_kernel_utility.hpp>
 #include <srs_protocol_sdp.hpp>
 #include <srs_protocol_utility.hpp>
@@ -747,6 +748,7 @@ public:
         return srs_success;
     }
     virtual srs_error_t on_sequence_header() { return srs_success; }
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec) { return srs_success; }
     virtual void update_duration(uint64_t dts) {}
     virtual srs_error_t recover_hls() { return srs_success; }
 
@@ -2238,4 +2240,1309 @@ VOID TEST(HlsFmp4MuxerKeysTest, InitFileKidIsZero)
         tencs++;
     }
     EXPECT_EQ(2, tencs);
+}
+
+// --- HLS TS startup codec discovery -------------------------------------------------------------
+
+// Read a whole file into a binary string.
+static std::string hls_startup_read_file(const std::string &path)
+{
+    std::ifstream ifs(path.c_str(), std::ios::binary);
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+    return ss.str();
+}
+
+// The stream types of every PMT section in an SRS-written TS, in transmission order. SRS writes
+// each PMT in a single payload-unit-start packet, so this minimal parser is enough.
+static std::vector<std::vector<uint8_t> > hls_startup_pmt_stream_types(const std::string &data)
+{
+    std::vector<std::vector<uint8_t> > result;
+    const size_t plen = SRS_TS_PACKET_SIZE;
+    // Mirrors TS_PMT_PID in srs_kernel_ts.cpp (a .cpp-local define).
+    const int pmt_pid = 0x1001;
+
+    for (size_t off = 0; off + plen <= data.size(); off += plen) {
+        const unsigned char *p = (const unsigned char *)data.data() + off;
+        if (p[0] != 0x47) {
+            continue;
+        }
+        int pid = ((p[1] & 0x1F) << 8) | p[2];
+        if (pid != pmt_pid) {
+            continue;
+        }
+        int payload_off = 4;
+        int afc = (p[3] >> 4) & 0x03;
+        if (afc == 0x02) { // adaptation field only
+            continue;
+        }
+        if (afc == 0x03) { // adaptation field + payload
+            payload_off += 1 + p[4];
+        }
+        if (payload_off + 13 > (int)plen) {
+            continue;
+        }
+        // pointer_field then table_id.
+        int pos = payload_off + 1;
+        if (p[pos] != 0x02) { // PMT table_id
+            continue;
+        }
+        int section_length = ((p[pos + 1] & 0x0F) << 8) | p[pos + 2];
+        int end = pos + 3 + section_length;
+        if (end > (int)plen) {
+            end = (int)plen;
+        }
+        int q = pos + 12 + (((p[pos + 10] & 0x0F) << 8) | p[pos + 11]);
+
+        std::vector<uint8_t> types;
+        while (q + 5 <= end) {
+            types.push_back(p[q]);
+            int es_info_length = ((p[q + 3] & 0x0F) << 8) | p[q + 4];
+            q += 5 + es_info_length;
+        }
+        result.push_back(types);
+    }
+    return result;
+}
+
+// Count the PES starts on a PID, which is one per message written.
+static int hls_startup_count_pes(const std::string &data, int pes_pid)
+{
+    int count = 0;
+    const size_t plen = SRS_TS_PACKET_SIZE;
+    for (size_t off = 0; off + plen <= data.size(); off += plen) {
+        const unsigned char *p = (const unsigned char *)data.data() + off;
+        if (p[0] != 0x47) {
+            continue;
+        }
+        int pid = ((p[1] & 0x1F) << 8) | p[2];
+        // payload_unit_start_indicator
+        if (pid == pes_pid && (p[1] & 0x40)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// The PCR_PID of every PMT section in an SRS-written TS, in transmission order.
+static std::vector<int> hls_startup_pmt_pcr_pids(const std::string &data)
+{
+    std::vector<int> result;
+    const size_t plen = SRS_TS_PACKET_SIZE;
+    // Mirrors TS_PMT_PID in srs_kernel_ts.cpp (a .cpp-local define).
+    const int pmt_pid = 0x1001;
+
+    for (size_t off = 0; off + plen <= data.size(); off += plen) {
+        const unsigned char *p = (const unsigned char *)data.data() + off;
+        if (p[0] != 0x47) {
+            continue;
+        }
+        int pid = ((p[1] & 0x1F) << 8) | p[2];
+        if (pid != pmt_pid) {
+            continue;
+        }
+        int payload_off = 4;
+        int afc = (p[3] >> 4) & 0x03;
+        if (afc == 0x02) {
+            continue;
+        }
+        if (afc == 0x03) {
+            payload_off += 1 + p[4];
+        }
+        if (payload_off + 13 > (int)plen) {
+            continue;
+        }
+        int pos = payload_off + 1;
+        if (p[pos] != 0x02) {
+            continue;
+        }
+        result.push_back(((p[pos + 8] & 0x1F) << 8) | p[pos + 9]);
+    }
+    return result;
+}
+
+// Whether any packet on the PID carries a PCR in its adaptation field.
+static bool hls_startup_has_pcr(const std::string &data, int pid)
+{
+    const size_t plen = SRS_TS_PACKET_SIZE;
+    for (size_t off = 0; off + plen <= data.size(); off += plen) {
+        const unsigned char *p = (const unsigned char *)data.data() + off;
+        if (p[0] != 0x47) {
+            continue;
+        }
+        if ((((p[1] & 0x1F) << 8) | p[2]) != pid) {
+            continue;
+        }
+        int afc = (p[3] >> 4) & 0x03;
+        if (afc != 0x02 && afc != 0x03) {
+            continue;
+        }
+        if (p[4] > 0 && (p[5] & 0x10)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// One media entry of an SRS-written playlist, with the discontinuity tag that precedes it.
+struct HlsStartupPlaylistEntry {
+    bool discontinuity_;
+    int duration_ms_;
+    std::string uri_;
+};
+
+// Parse the media entries of an SRS-written playlist. A discontinuity belongs to the entry that
+// follows it, which is the entry whose track set changes.
+static std::vector<HlsStartupPlaylistEntry> hls_startup_playlist_entries(const std::string &data)
+{
+    std::vector<HlsStartupPlaylistEntry> entries;
+    std::stringstream ss(data);
+    std::string line;
+    bool discontinuity = false;
+    int duration_ms = -1;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line[line.length() - 1] == '\r') {
+            line = line.substr(0, line.length() - 1);
+        }
+        if (line == "#EXT-X-DISCONTINUITY") {
+            discontinuity = true;
+            continue;
+        }
+        if (line.compare(0, 8, "#EXTINF:") == 0) {
+            duration_ms = (int)(::atof(line.substr(8).c_str()) * 1000);
+            continue;
+        }
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        HlsStartupPlaylistEntry entry;
+        entry.discontinuity_ = discontinuity;
+        entry.duration_ms_ = duration_ms;
+        entry.uri_ = line;
+        entries.push_back(entry);
+        discontinuity = false;
+        duration_ms = -1;
+    }
+    return entries;
+}
+
+// Write one cached audio message through the muxer. end_dts is the end of the last frame in the
+// message, in 90kHz; zero means unknown and the message start is used.
+static srs_error_t hls_startup_flush_audio(SrsHlsMuxer *muxer, int64_t dts, int64_t end_dts = 0)
+{
+    SrsUniquePtr<SrsTsMessageCache> cache(new SrsTsMessageCache());
+    cache->audio_ = new SrsTsMessage();
+    cache->audio_->dts_ = cache->audio_->pts_ = cache->audio_->start_pts_ = dts;
+    cache->audio_->end_dts_ = end_dts;
+    cache->audio_->sid_ = SrsTsPESStreamIdAudioCommon;
+    std::string payload(201, (char)(0x40 + (dts % 7)));
+    cache->audio_->payload_->append(payload.data(), (int)payload.length());
+    return muxer->flush_audio(cache.get());
+}
+
+// Write one cached video message through the muxer.
+static srs_error_t hls_startup_flush_video(SrsHlsMuxer *muxer, int64_t dts)
+{
+    SrsUniquePtr<SrsTsMessageCache> cache(new SrsTsMessageCache());
+    cache->video_ = new SrsTsMessage();
+    cache->video_->dts_ = cache->video_->pts_ = cache->video_->start_pts_ = dts;
+    cache->video_->sid_ = SrsTsPESStreamIdVideoCommon;
+    cache->video_->write_pcr_ = true;
+    std::string payload(257, (char)(0x20 + (dts % 7)));
+    cache->video_->payload_->append(payload.data(), (int)payload.length());
+    return muxer->flush_video(cache.get());
+}
+
+// Remove the files a test stream writes.
+static void hls_startup_cleanup(const std::string &stream)
+{
+    SrsPath path;
+    std::string dir = "./objs/nginx/html/live";
+    for (int i = 0; i < 8; i++) {
+        std::stringstream ss;
+        ss << dir << "/" << stream << "-" << i << ".ts";
+        if (path.exists(ss.str())) {
+            path.unlink(ss.str());
+        }
+        if (path.exists(ss.str() + ".tmp")) {
+            path.unlink(ss.str() + ".tmp");
+        }
+    }
+    std::string m3u8 = dir + "/" + stream + ".m3u8";
+    if (path.exists(m3u8)) {
+        path.unlink(m3u8);
+    }
+}
+
+// Start a TS muxer for a test stream with a 2s fragment and no keys.
+static void hls_startup_start(SrsHlsMuxer *muxer, MockFmp4SrsRequest *req, const std::string &stream)
+{
+    srs_error_t err;
+
+    req->stream_ = stream;
+    HELPER_ASSERT_SUCCESS(muxer->initialize());
+    HELPER_ASSERT_SUCCESS(muxer->on_publish(req));
+    HELPER_ASSERT_SUCCESS(muxer->update_config(req, "", "./objs/nginx/html", "[app]/[stream].m3u8",
+                                               "[app]/[stream]-[seq].ts", 2 * SRS_UTIME_SECONDS, 60 * SRS_UTIME_SECONDS,
+                                               false, 2.1, true, true, false, 5, "", "", ""));
+    HELPER_ASSERT_SUCCESS(muxer->segment_open());
+    muxer->set_latest_acodec(SrsAudioCodecIdAAC);
+}
+
+// Cache the 84 raw AAC frames through 1.927s of the audio-first fixtures in the controller, so the
+// last aggregate is still pending when the first video media frame arrives. Returns the start and
+// measured end of that pending aggregate in milliseconds.
+static srs_error_t hls_startup_cache_pending_audio(SrsHlsController *controller, SrsFormat *format,
+                                                   int64_t *pending_start_ms, int64_t *pending_end_ms)
+{
+    srs_error_t err = srs_success;
+
+    format->acodec_ = new SrsAudioCodecConfig();
+    format->acodec_->id_ = SrsAudioCodecIdAAC;
+    format->acodec_->sound_rate_ = SrsAudioSampleRate44100;
+    format->audio_ = new SrsParsedAudioPacket();
+    if ((err = format->audio_->initialize(format->acodec_)) != srs_success) {
+        return srs_error_wrap(err, "init audio");
+    }
+
+    for (int i = 0; i < 84; i++) {
+        SrsUniquePtr<SrsMediaPacket> packet(new SrsMediaPacket());
+        packet->timestamp_ = i * 23;
+        packet->message_type_ = SrsFrameTypeAudio;
+
+        char *payload = new char[10];
+        for (int j = 0; j < 10; j++) {
+            payload[j] = (char)(i + j);
+        }
+        packet->wrap(payload, 10);
+
+        format->audio_->nb_samples_ = 1;
+        format->audio_->samples_[0].bytes_ = payload;
+        format->audio_->samples_[0].size_ = 10;
+
+        if ((err = controller->write_audio(packet.get(), format)) != srs_success) {
+            return srs_error_wrap(err, "write audio");
+        }
+    }
+
+    if (!controller->tsmc_->audio_) {
+        return srs_error_new(ERROR_SYSTEM_STREAM_BUSY, "no pending audio");
+    }
+    *pending_start_ms = controller->tsmc_->audio_->dts_ / 90;
+    *pending_end_ms = controller->tsmc_->audio_->end_dts_ / 90;
+    return err;
+}
+
+// Write one AAC frame at timestamp_ms with the FLV sound rate 44.1kHz and the given decoded ASC
+// sample-rate index, and return the measured frame duration (end_dts - dts) in 90kHz units.
+static srs_error_t hls_startup_one_aac_frame(SrsHlsController *controller, SrsFormat *format,
+                                             int timestamp_ms, int aac_rate_index, int64_t *frame_dts)
+{
+    srs_error_t err = srs_success;
+
+    format->acodec_ = new SrsAudioCodecConfig();
+    format->acodec_->id_ = SrsAudioCodecIdAAC;
+    format->acodec_->sound_rate_ = SrsAudioSampleRate44100;
+    format->acodec_->aac_sample_rate_ = (uint8_t)aac_rate_index;
+    format->audio_ = new SrsParsedAudioPacket();
+    if ((err = format->audio_->initialize(format->acodec_)) != srs_success) {
+        return srs_error_wrap(err, "init audio");
+    }
+
+    SrsUniquePtr<SrsMediaPacket> packet(new SrsMediaPacket());
+    packet->timestamp_ = timestamp_ms;
+    packet->message_type_ = SrsFrameTypeAudio;
+
+    char *payload = new char[10];
+    for (int j = 0; j < 10; j++) {
+        payload[j] = (char)(0x30 + j);
+    }
+    packet->wrap(payload, 10);
+
+    format->audio_->nb_samples_ = 1;
+    format->audio_->samples_[0].bytes_ = payload;
+    format->audio_->samples_[0].size_ = 10;
+
+    if ((err = controller->write_audio(packet.get(), format)) != srs_success) {
+        return srs_error_wrap(err, "write audio");
+    }
+    if (!controller->tsmc_->audio_) {
+        return srs_error_new(ERROR_SYSTEM_STREAM_BUSY, "no pending audio");
+    }
+    *frame_dts = controller->tsmc_->audio_->end_dts_ - controller->tsmc_->audio_->dts_;
+    return err;
+}
+
+// Write one AVC keyframe media packet through the controller at the given timestamp.
+static srs_error_t hls_startup_write_video_frame(SrsHlsController *controller, SrsFormat *format, int timestamp_ms)
+{
+    srs_error_t err = srs_success;
+
+    format->vcodec_ = new SrsVideoCodecConfig();
+    format->vcodec_->id_ = SrsVideoCodecIdAVC;
+    format->video_ = new SrsParsedVideoPacket();
+    if ((err = format->video_->initialize(format->vcodec_)) != srs_success) {
+        return srs_error_wrap(err, "init video");
+    }
+    format->video_->frame_type_ = SrsVideoAvcFrameTypeKeyFrame;
+    format->video_->avc_packet_type_ = SrsVideoAvcFrameTraitNALU;
+    format->video_->has_aud_ = true;
+
+    char *video_payload = new char[4];
+    video_payload[0] = 0x65;
+    video_payload[1] = 0x88;
+    video_payload[2] = 0x84;
+    video_payload[3] = 0x00;
+
+    SrsUniquePtr<SrsMediaPacket> video_packet(new SrsMediaPacket());
+    video_packet->timestamp_ = timestamp_ms;
+    video_packet->message_type_ = SrsFrameTypeVideo;
+    video_packet->wrap(video_payload, 4);
+
+    format->video_->nb_samples_ = 1;
+    format->video_->samples_[0].bytes_ = video_payload;
+    format->video_->samples_[0].size_ = 4;
+
+    return controller->write_video(video_packet.get(), format);
+}
+
+// Startup audio written before the first video media is published as its own audio-only segment. Its
+// duration is measured to the end of the last AAC frame actually written, not to the start of the
+// last aggregate, and the next segment starts with the codec of the first video media frame.
+VOID TEST(HlsMuxerStartupTest, AudioFirstSegmentUsesTheWrittenAudioEnd)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-audio-end";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    // The last aggregate starts at 5.201s but its AAC frames end at 5.944s, as in the long lead-in
+    // regression where the playlist listed 5.201s.
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 720 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 5201 * 90, 5944 * 90));
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(5201, (int)srsu2msi(muxer.current_->duration()));
+
+    // The first video media frame applies HEVC.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    SrsHlsSegment *prelude = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(0));
+    ASSERT_TRUE(prelude != NULL);
+    EXPECT_EQ(0, prelude->sequence_no_);
+    EXPECT_EQ(5944, (int)srsu2msi(prelude->duration()));
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(1, muxer.current_->sequence_no_);
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.current_->tscw_->vcodec());
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 6000 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 8000 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(2, muxer.segments_->size());
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(1));
+    ASSERT_TRUE(video != NULL);
+    EXPECT_EQ(1, video->sequence_no_);
+
+    std::string prelude_data = hls_startup_read_file(prelude->fullpath());
+    std::vector<std::vector<uint8_t> > prelude_pmts = hls_startup_pmt_stream_types(prelude_data);
+    ASSERT_EQ(1, (int)prelude_pmts.size());
+    ASSERT_EQ(1, (int)prelude_pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, prelude_pmts[0][0]);
+    // Both startup audio messages are in the prelude, each once, with an audio clock.
+    EXPECT_EQ(2, hls_startup_count_pes(prelude_data, 0x101));
+    EXPECT_TRUE(hls_startup_has_pcr(prelude_data, 0x101));
+
+    std::string video_data = hls_startup_read_file(video->fullpath());
+    std::vector<std::vector<uint8_t> > video_pmts = hls_startup_pmt_stream_types(video_data);
+    ASSERT_EQ(1, (int)video_pmts.size());
+    ASSERT_EQ(2, (int)video_pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, video_pmts[0][0]);
+    EXPECT_EQ(SrsTsStreamVideoHEVC, video_pmts[0][1]);
+    EXPECT_EQ(0, hls_startup_count_pes(video_data, 0x101));
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// The audio-only segment finalized at the first video media frame is the same unpublished segment:
+// its identity, path, URI, sequence, encryption and sequence-header marker are kept, its audio is
+// written exactly once, and no key or floor bookkeeping runs for it again.
+VOID TEST(HlsMuxerStartupTest, AudioFirstSegmentIsPublishedWithoutReopen)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-no-reopen";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    ASSERT_TRUE(muxer.current_ != NULL);
+    SrsHlsSegment *prelude = muxer.current_;
+    int seq = prelude->sequence_no_;
+    std::string path = prelude->fullpath();
+    std::string uri = prelude->uri_;
+    unsigned char iv[16];
+    memcpy(iv, prelude->iv_, 16);
+    bool encrypted = prelude->encrypted_;
+    prelude->set_sequence_header(true);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 720 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+
+    // The same segment object is published, not a reopened replacement.
+    ASSERT_EQ(1, muxer.segments_->size());
+    EXPECT_EQ((ISrsFragment *)prelude, muxer.segments_->at(0));
+    EXPECT_EQ(seq, prelude->sequence_no_);
+    EXPECT_EQ(path, prelude->fullpath());
+    EXPECT_EQ(uri, prelude->uri_);
+    EXPECT_TRUE(prelude->is_sequence_header());
+    EXPECT_EQ(encrypted, prelude->encrypted_);
+    EXPECT_EQ(0, memcmp(iv, prelude->iv_, 16));
+
+    // The next segment continues the sequence, so the audio is not replayed into a reused number.
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(seq + 1, muxer.current_->sequence_no_);
+    EXPECT_EQ(SrsVideoCodecIdAVC, muxer.current_->tscw_->vcodec());
+
+    std::string data = hls_startup_read_file(prelude->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(1, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    EXPECT_EQ(1, hls_startup_count_pes(data, 0x101));
+    EXPECT_EQ(0, hls_startup_count_pes(data, 0x100));
+    EXPECT_TRUE(hls_startup_has_pcr(data, 0x101));
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// A video sequence header only marks the segment for the discontinuity. The audio written before the
+// first video media frame keeps an audio-only PMT and carries the PCR, even when the video PES is
+// delayed, instead of advertising a video stream whose PCR never appears.
+VOID TEST(HlsMuxerStartupTest, VideoSequenceHeaderKeepsTheAudioClock)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-audio-pcr";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(muxer.on_sequence_header());
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_TRUE(muxer.current_->is_sequence_header());
+    EXPECT_EQ(SrsVideoCodecIdDisabled, muxer.latest_vcodec());
+    EXPECT_EQ(SrsVideoCodecIdDisabled, muxer.current_->tscw_->vcodec());
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 720 * 90));
+    muxer.current_->writer_->close();
+
+    std::string data = hls_startup_read_file(muxer.current_->tmppath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(1, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    std::vector<int> pcr_pids = hls_startup_pmt_pcr_pids(data);
+    ASSERT_EQ(1, (int)pcr_pids.size());
+    EXPECT_EQ(0x101, pcr_pids[0]);
+    EXPECT_TRUE(hls_startup_has_pcr(data, 0x101));
+    EXPECT_FALSE(hls_startup_has_pcr(data, 0x100));
+    EXPECT_EQ(0, hls_startup_count_pes(data, 0x100));
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// A new publish must not inherit the previous publication's codecs. An audio-only segment of the
+// republish declares only its real stream and places PCR on the audio PID.
+VOID TEST(HlsMuxerStartupTest, RepublishForgetsThePreviousVideoCodec)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-republish";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    // The previous publication used H.264, then it ended before any media established a segment.
+    muxer.set_latest_vcodec(SrsVideoCodecIdAVC);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+    muxer.on_unpublish();
+
+    HELPER_ASSERT_SUCCESS(muxer.on_publish(&req));
+    EXPECT_EQ(SrsVideoCodecIdForbidden, muxer.latest_vcodec());
+    // The audio codec of any message still cached by the controller is kept, so it can be flushed.
+    EXPECT_EQ(SrsAudioCodecIdAAC, muxer.latest_acodec());
+
+    HELPER_ASSERT_SUCCESS(muxer.segment_open());
+    EXPECT_EQ(SrsVideoCodecIdDisabled, muxer.latest_vcodec());
+    EXPECT_EQ(SrsAudioCodecIdAAC, muxer.latest_acodec());
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 720 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 720 * 90, 1440 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    SrsHlsSegment *segment = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(0));
+    ASSERT_TRUE(segment != NULL);
+    std::string data = hls_startup_read_file(segment->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(1, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    std::vector<int> pcr_pids = hls_startup_pmt_pcr_pids(data);
+    ASSERT_EQ(1, (int)pcr_pids.size());
+    EXPECT_EQ(0x101, pcr_pids[0]);
+    EXPECT_TRUE(hls_startup_has_pcr(data, 0x101));
+    EXPECT_FALSE(hls_startup_has_pcr(data, 0x100));
+    EXPECT_EQ(0, hls_startup_count_pes(data, 0x100));
+
+    hls_startup_cleanup(stream);
+}
+
+// Audio whose end is unknown cannot measure a positive duration. Keep it in the current segment and
+// let the regular PMT refresh advertise the codec rather than publish a zero or understated entry.
+VOID TEST(HlsMuxerStartupTest, UnmeasuredAudioKeepsItsSegment)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-unmeasured";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0));
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(0, (int)srsu2msi(muxer.current_->duration()));
+    int seq = muxer.current_->sequence_no_;
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    EXPECT_EQ(0, muxer.segments_->size());
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(seq, muxer.current_->sequence_no_);
+    EXPECT_EQ(SrsVideoCodecIdAVC, muxer.current_->tscw_->vcodec());
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1943 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 3000 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    SrsHlsSegment *segment = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(0));
+    ASSERT_TRUE(segment != NULL);
+    std::string data = hls_startup_read_file(segment->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(data);
+    ASSERT_EQ(2, (int)pmts.size());
+    ASSERT_EQ(1, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    ASSERT_EQ(2, (int)pmts[1].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[1][0]);
+    EXPECT_EQ(SrsTsStreamVideoH264, pmts[1][1]);
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// Once video media has been written the segment is established: a later codec change keeps the
+// media already written and lets the regular PMT refresh advertise the new codec.
+VOID TEST(HlsMuxerStartupTest, EstablishedVideoKeepsTheSegmentOnCodecChange)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-established";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 720 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1943 * 90));
+    ASSERT_TRUE(muxer.current_ != NULL);
+    int seq = muxer.current_->sequence_no_;
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    EXPECT_EQ(0, muxer.segments_->size());
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(seq, muxer.current_->sequence_no_);
+    EXPECT_EQ(SrsVideoCodecIdHEVC, muxer.current_->tscw_->vcodec());
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// The audio-only entry keeps its real sequence-header marker, and the entry that first carries video
+// gets its own marker: the track set changes from AAC-only to AAC+video there, which RFC 8216
+// 4.3.2.3 requires a discontinuity for.
+VOID TEST(HlsMuxerStartupTest, AudioOnlyToVideoBoundaryIsDiscontinuous)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-track-change";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    // The audio-first stream has a video sequence header before any media, which marks the segment.
+    HELPER_ASSERT_SUCCESS(muxer.on_sequence_header());
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 1486 * 90));
+
+    // The first video media frame closes the audio-only prefix and opens the video segment.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1943 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 3000 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(2, muxer.segments_->size());
+    SrsHlsSegment *prelude = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(0));
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(1));
+    ASSERT_TRUE(prelude != NULL && video != NULL);
+
+    std::string data = hls_startup_read_file(muxer.m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(data);
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_EQ(prelude->uri_, entries[0].uri_);
+    EXPECT_EQ(video->uri_, entries[1].uri_);
+    EXPECT_TRUE(entries[0].discontinuity_);
+    EXPECT_TRUE(entries[1].discontinuity_);
+
+    // The video entry still starts with a PMT that advertises both real streams.
+    std::string video_data = hls_startup_read_file(video->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(video_data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(2, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    EXPECT_EQ(SrsTsStreamVideoH264, pmts[0][1]);
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// When the prior pure-audio segment closed by a normal reap, the next segment is opened before the
+// first video media arrives. It is still the AAC-only to AAC+video boundary and must be marked.
+VOID TEST(HlsMuxerStartupTest, NaturalReapBoundaryIsDiscontinuous)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-reap-change";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    // A pure-audio segment is reaped and published, then the next one is opened, as reap_segment does.
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 720 * 90));
+    muxer.update_duration(720 * 90);
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+    HELPER_ASSERT_SUCCESS(muxer.segment_open());
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_FALSE(muxer.current_->is_sequence_header());
+
+    // No audio has been written into the new segment yet when the first video media arrives.
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdHEVC));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1943 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 3000 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(2, muxer.segments_->size());
+    std::string data = hls_startup_read_file(muxer.m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(data);
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_FALSE(entries[0].discontinuity_);
+    EXPECT_TRUE(entries[1].discontinuity_);
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// A video-first stream starts its first entry with the video track already present, so there is no
+// track-set change and the marker must not be added merely because a sequence header arrived.
+VOID TEST(HlsMuxerStartupTest, VideoFirstHasNoTrackChangeMarker)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-video-first";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 0));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 2000 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    std::string data = hls_startup_read_file(muxer.m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(data);
+    ASSERT_EQ(1, (int)entries.size());
+    EXPECT_FALSE(entries[0].discontinuity_);
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// A repeated identical video sequence header keeps its single existing marker; it must not be
+// treated as a new track set when video media starts.
+VOID TEST(HlsMuxerStartupTest, RepeatedHeaderDoesNotMarkTheVideoEntry)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-repeat-header";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(muxer.on_sequence_header());
+    HELPER_ASSERT_SUCCESS(muxer.on_sequence_header());
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 0));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 2000 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    std::string data = hls_startup_read_file(muxer.m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(data);
+    ASSERT_EQ(1, (int)entries.size());
+    EXPECT_TRUE(entries[0].discontinuity_);
+    int markers = 0;
+    for (size_t pos = 0; (pos = data.find("#EXT-X-DISCONTINUITY", pos)) != std::string::npos; pos++) {
+        markers++;
+    }
+    EXPECT_EQ(1, markers);
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// The audio-only prefix duration is measured from the audio actually written, not from a cached
+// aggregate that the controller has timestamped but not flushed into the segment.
+VOID TEST(HlsMuxerStartupTest, AudioPrefixDurationExcludesPendingInput)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-pending-input";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 1486 * 90));
+    // The controller caches the next aggregate at 1.700s and updates the duration before it is written.
+    muxer.update_duration(1700 * 90);
+    ASSERT_TRUE(muxer.current_ != NULL);
+    EXPECT_EQ(1700, (int)srsu2msi(muxer.current_->duration()));
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    SrsHlsSegment *prelude = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(0));
+    ASSERT_TRUE(prelude != NULL);
+    EXPECT_EQ(1486, (int)srsu2msi(prelude->duration()));
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// The prefix duration is relative to its own start, not the absolute end timestamp.
+VOID TEST(HlsMuxerStartupTest, AudioPrefixDurationIsRelativeToItsStart)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-relative-duration";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 1000 * 90, 1486 * 90));
+    muxer.update_duration(1700 * 90);
+
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+
+    ASSERT_EQ(1, muxer.segments_->size());
+    SrsHlsSegment *prelude = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(0));
+    ASSERT_TRUE(prelude != NULL);
+    EXPECT_EQ(486, (int)srsu2msi(prelude->duration()));
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// A disconnect right after the first video media frame must not lose the startup AAC cached before
+// it or that frame. The controller writes the cached audio into the video segment before the frame,
+// so the segment spans real media and is published instead of having its start lowered to the audio
+// timestamp after the video was written, which zeroes its duration.
+VOID TEST(HlsMuxerStartupTest, FirstVideoFrameKeepsTheStartupAudioOnDisconnect)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-disconnect";
+    hls_startup_cleanup(stream);
+
+    MockAppConfig mock_config;
+    SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+    controller->config_ = &mock_config;
+    HELPER_ASSERT_SUCCESS(controller->initialize());
+
+    MockFmp4SrsRequest req;
+    req.stream_ = stream;
+    HELPER_ASSERT_SUCCESS(controller->on_publish(&req));
+
+    SrsHlsMuxer *muxer = dynamic_cast<SrsHlsMuxer *>(controller->muxer_);
+    ASSERT_TRUE(muxer != NULL);
+
+    SrsUniquePtr<SrsFormat> format(new SrsFormat());
+    format->acodec_ = new SrsAudioCodecConfig();
+    format->acodec_->id_ = SrsAudioCodecIdAAC;
+    format->acodec_->sound_rate_ = SrsAudioSampleRate44100;
+    format->audio_ = new SrsParsedAudioPacket();
+    HELPER_ASSERT_SUCCESS(format->audio_->initialize(format->acodec_));
+
+    // The 84 raw AAC frames through 1.927s of the audio-first fixtures, paced at 44.1kHz.
+    for (int i = 0; i < 84; i++) {
+        SrsUniquePtr<SrsMediaPacket> packet(new SrsMediaPacket());
+        packet->timestamp_ = i * 23;
+        packet->message_type_ = SrsFrameTypeAudio;
+
+        char *payload = new char[10];
+        for (int j = 0; j < 10; j++) {
+            payload[j] = (char)(i + j);
+        }
+        packet->wrap(payload, 10);
+
+        format->audio_->nb_samples_ = 1;
+        format->audio_->samples_[0].bytes_ = payload;
+        format->audio_->samples_[0].size_ = 10;
+
+        HELPER_ASSERT_SUCCESS(controller->write_audio(packet.get(), format.get()));
+    }
+    ASSERT_TRUE(controller->tsmc_->audio_ != NULL);
+    int64_t pending_start_ms = controller->tsmc_->audio_->dts_ / 90;
+
+    // The first video media frame at 1.943s, then the publisher leaves immediately.
+    format->vcodec_ = new SrsVideoCodecConfig();
+    format->vcodec_->id_ = SrsVideoCodecIdAVC;
+    format->video_ = new SrsParsedVideoPacket();
+    HELPER_ASSERT_SUCCESS(format->video_->initialize(format->vcodec_));
+    format->video_->frame_type_ = SrsVideoAvcFrameTypeKeyFrame;
+    format->video_->avc_packet_type_ = SrsVideoAvcFrameTraitNALU;
+    format->video_->has_aud_ = true;
+
+    char *video_payload = new char[4];
+    video_payload[0] = 0x65;
+    video_payload[1] = 0x88;
+    video_payload[2] = 0x84;
+    video_payload[3] = 0x00;
+
+    SrsUniquePtr<SrsMediaPacket> video_packet(new SrsMediaPacket());
+    video_packet->timestamp_ = 1943;
+    video_packet->message_type_ = SrsFrameTypeVideo;
+    video_packet->wrap(video_payload, 4);
+
+    format->video_->nb_samples_ = 1;
+    format->video_->samples_[0].bytes_ = video_payload;
+    format->video_->samples_[0].size_ = 4;
+
+    HELPER_ASSERT_SUCCESS(controller->write_video(video_packet.get(), format.get()));
+    EXPECT_TRUE(controller->tsmc_->audio_ == NULL);
+
+    HELPER_ASSERT_SUCCESS(controller->on_unpublish());
+
+    // Both the audio-only prefix and the video entry are published, and the video entry spans the
+    // written startup audio to the first frame.
+    ASSERT_EQ(2, muxer->segments_->size());
+    SrsHlsSegment *prelude = dynamic_cast<SrsHlsSegment *>(muxer->segments_->at(0));
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer->segments_->at(1));
+    ASSERT_TRUE(prelude != NULL && video != NULL);
+    EXPECT_EQ(1943 - pending_start_ms, (int)srsu2msi(video->duration()));
+    EXPECT_GT((int)srsu2msi(video->duration()), 0);
+
+    std::string video_data = hls_startup_read_file(video->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(video_data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(2, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    EXPECT_EQ(SrsTsStreamVideoH264, pmts[0][1]);
+    EXPECT_EQ(1, hls_startup_count_pes(video_data, 0x100));
+    EXPECT_GE(hls_startup_count_pes(video_data, 0x101), 1);
+    EXPECT_TRUE(hls_startup_has_pcr(video_data, 0x100));
+
+    std::string playlist = hls_startup_read_file(muxer->m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(playlist);
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_TRUE(entries[1].discontinuity_);
+
+    controller->dispose();
+    hls_startup_cleanup(stream);
+}
+
+// A pending AAC tail whose last frame ends after the first video DTS is a real positive span. The
+// ordinary 100ms minimum must not drop it together with the first frame: the entry is measured to the
+// audio end and kept, with the video PES and PCR in the same entry.
+VOID TEST(HlsMuxerStartupTest, PendingAudioTailKeepsTheFirstVideoSegment)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-pending-tail";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 1486 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    // The pending aggregate starts at 1.486s and its last AAC frame ends at 1.950s; the first video
+    // media frame is at 1.510s, so the video DTS alone understates the media span.
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 1486 * 90, 1950 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1510 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(2, muxer.segments_->size());
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(1));
+    ASSERT_TRUE(video != NULL);
+    EXPECT_EQ(1950 - 1486, (int)srsu2msi(video->duration()));
+
+    std::string video_data = hls_startup_read_file(video->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(video_data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(2, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    EXPECT_EQ(SrsTsStreamVideoH264, pmts[0][1]);
+    EXPECT_EQ(1, hls_startup_count_pes(video_data, 0x100));
+    EXPECT_GE(hls_startup_count_pes(video_data, 0x101), 1);
+    EXPECT_TRUE(hls_startup_has_pcr(video_data, 0x100));
+
+    std::string playlist = hls_startup_read_file(muxer.m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(playlist);
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_TRUE(entries[1].discontinuity_);
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// A single pending AAC frame at the same DTS as the first video is still a real, positive span (one
+// AAC frame). The startup entry is kept even though it is below the normal minimum.
+VOID TEST(HlsMuxerStartupTest, PendingSingleAacAtTheFirstVideoKeepsTheSegment)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-single-aac";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 1486 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    // One AAC frame at 1.486s, ending at 1.509s, and the first video media at the same DTS.
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 1486 * 90, 1509 * 90));
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1486 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    ASSERT_EQ(2, muxer.segments_->size());
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer.segments_->at(1));
+    ASSERT_TRUE(video != NULL);
+    EXPECT_EQ(1509 - 1486, (int)srsu2msi(video->duration()));
+    EXPECT_TRUE(hls_startup_has_pcr(hls_startup_read_file(video->fullpath()), 0x100));
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// With no remaining AAC and no measured span, the ordinary zero-duration policy still drops the first
+// video entry, so an empty startup transition does not publish a zero-length segment.
+VOID TEST(HlsMuxerStartupTest, FirstVideoWithoutPendingAudioKeepsTheZeroDurationPolicy)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-zero-span";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 1486 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.update_video_codec(SrsVideoCodecIdAVC));
+    // No audio is pending; the first video media is the only media in the new segment.
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_video(&muxer, 1486 * 90));
+    HELPER_ASSERT_SUCCESS(muxer.segment_close());
+
+    // Only the audio-only prefix is published; the zero-duration video entry is dropped as before.
+    ASSERT_EQ(1, muxer.segments_->size());
+
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// The controller flushes the pending AAC aggregate into the first video entry. When the aggregate's
+// last frame ends after the first video DTS, the entry is measured to the audio end and published
+// with the video PES and PCR instead of being dropped by the minimum duration.
+VOID TEST(HlsMuxerStartupTest, FirstVideoBeforeThePendingAudioEndKeepsTheMeasuredSpan)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-video-1510";
+    hls_startup_cleanup(stream);
+
+    MockAppConfig mock_config;
+    SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+    controller->config_ = &mock_config;
+    HELPER_ASSERT_SUCCESS(controller->initialize());
+
+    MockFmp4SrsRequest req;
+    req.stream_ = stream;
+    HELPER_ASSERT_SUCCESS(controller->on_publish(&req));
+
+    SrsHlsMuxer *muxer = dynamic_cast<SrsHlsMuxer *>(controller->muxer_);
+    ASSERT_TRUE(muxer != NULL);
+
+    SrsUniquePtr<SrsFormat> format(new SrsFormat());
+    int64_t pending_start_ms = 0, pending_end_ms = 0;
+    HELPER_ASSERT_SUCCESS(hls_startup_cache_pending_audio(controller.get(), format.get(), &pending_start_ms, &pending_end_ms));
+    ASSERT_GT(pending_start_ms, 0);
+    // The first video media arrives 24ms after the pending aggregate starts, before its last frame
+    // ends, so the video DTS alone understates the segment.
+    int video_ts = (int)pending_start_ms + 24;
+    ASSERT_GT(pending_end_ms, video_ts);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_write_video_frame(controller.get(), format.get(), video_ts));
+    EXPECT_TRUE(controller->tsmc_->audio_ == NULL);
+    HELPER_ASSERT_SUCCESS(controller->on_unpublish());
+
+    ASSERT_EQ(2, muxer->segments_->size());
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer->segments_->at(1));
+    ASSERT_TRUE(video != NULL);
+    EXPECT_EQ(pending_end_ms - pending_start_ms, (int)srsu2msi(video->duration()));
+    EXPECT_GT((int)srsu2msi(video->duration()), 100);
+
+    std::string video_data = hls_startup_read_file(video->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(video_data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(2, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    EXPECT_EQ(SrsTsStreamVideoH264, pmts[0][1]);
+    EXPECT_EQ(1, hls_startup_count_pes(video_data, 0x100));
+    EXPECT_GE(hls_startup_count_pes(video_data, 0x101), 1);
+    EXPECT_TRUE(hls_startup_has_pcr(video_data, 0x100));
+
+    std::string playlist = hls_startup_read_file(muxer->m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(playlist);
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_TRUE(entries[1].discontinuity_);
+
+    controller->dispose();
+    hls_startup_cleanup(stream);
+}
+
+// The stock HLS config uses a 2s fragment and td_ratio 1.0, so a segment overflows at 2s; the shared
+// mock uses a 10s fragment and td_ratio 1.5.
+class MockAppConfigHlsStockRatio : public MockAppConfig
+{
+public:
+    virtual srs_utime_t get_hls_fragment(std::string vhost) { return 2 * SRS_UTIME_SECONDS; }
+    virtual double get_hls_td_ratio(std::string vhost) { return 1.0; }
+};
+
+// The first video arrives a full fragment after the pending AAC. The pending audio must not be closed
+// into a video-advertising segment before the video is serialized: the first video entry carries both
+// the AAC and the video PES/PCR, and the marker belongs to that entry.
+VOID TEST(HlsMuxerStartupTest, FirstVideoAfterTheFragmentGapKeepsTheVideoPCR)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-video-4000";
+    hls_startup_cleanup(stream);
+
+    MockAppConfigHlsStockRatio mock_config;
+    SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+    controller->config_ = &mock_config;
+    HELPER_ASSERT_SUCCESS(controller->initialize());
+
+    MockFmp4SrsRequest req;
+    req.stream_ = stream;
+    HELPER_ASSERT_SUCCESS(controller->on_publish(&req));
+
+    SrsHlsMuxer *muxer = dynamic_cast<SrsHlsMuxer *>(controller->muxer_);
+    ASSERT_TRUE(muxer != NULL);
+
+    SrsUniquePtr<SrsFormat> format(new SrsFormat());
+    int64_t pending_start_ms = 0, pending_end_ms = 0;
+    HELPER_ASSERT_SUCCESS(hls_startup_cache_pending_audio(controller.get(), format.get(), &pending_start_ms, &pending_end_ms));
+    ASSERT_GT(pending_start_ms, 0);
+    // The first video arrives a full 2s fragment after the pending AAC ends.
+    ASSERT_GT(4000 - pending_end_ms, 2000);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_write_video_frame(controller.get(), format.get(), 4000));
+    HELPER_ASSERT_SUCCESS(controller->on_unpublish());
+
+    ASSERT_EQ(2, muxer->segments_->size());
+    SrsHlsSegment *video = dynamic_cast<SrsHlsSegment *>(muxer->segments_->at(1));
+    ASSERT_TRUE(video != NULL);
+    EXPECT_EQ(4000 - pending_start_ms, (int)srsu2msi(video->duration()));
+
+    std::string video_data = hls_startup_read_file(video->fullpath());
+    std::vector<std::vector<uint8_t> > pmts = hls_startup_pmt_stream_types(video_data);
+    ASSERT_EQ(1, (int)pmts.size());
+    ASSERT_EQ(2, (int)pmts[0].size());
+    EXPECT_EQ(SrsTsStreamAudioAAC, pmts[0][0]);
+    EXPECT_EQ(SrsTsStreamVideoH264, pmts[0][1]);
+    // The entry that advertises the video PID must actually carry the video PES and its PCR.
+    EXPECT_EQ(1, hls_startup_count_pes(video_data, 0x100));
+    EXPECT_GE(hls_startup_count_pes(video_data, 0x101), 1);
+    EXPECT_TRUE(hls_startup_has_pcr(video_data, 0x100));
+
+    std::string playlist = hls_startup_read_file(muxer->m3u8_);
+    std::vector<HlsStartupPlaylistEntry> entries = hls_startup_playlist_entries(playlist);
+    ASSERT_EQ(2, (int)entries.size());
+    EXPECT_TRUE(entries[1].discontinuity_);
+    EXPECT_EQ(video->uri_, entries[1].uri_);
+
+    controller->dispose();
+    hls_startup_cleanup(stream);
+}
+
+// A startup close failure still frees the current segment. Recovery must reopen one, as the normal
+// reap does, so the next packet has a segment to write into.
+VOID TEST(HlsMuxerStartupTest, StartupCloseFailureReopensTheSegment)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-close-failure";
+    hls_startup_cleanup(stream);
+
+    MockFmp4SrsRequest req;
+    SrsHlsMuxer muxer;
+    hls_startup_start(&muxer, &req, stream);
+
+    HELPER_ASSERT_SUCCESS(hls_startup_flush_audio(&muxer, 0, 1486 * 90));
+
+    // Remove the temporary file so the audio-only segment's rename fails, as a close failure does.
+    ASSERT_TRUE(muxer.current_ != NULL);
+    SrsPath path;
+    HELPER_ASSERT_SUCCESS(path.unlink(muxer.current_->tmppath()));
+
+    srs_error_t close_err = muxer.update_video_codec(SrsVideoCodecIdAVC);
+    EXPECT_TRUE(close_err != srs_success);
+    srs_freep(close_err);
+
+    // The failed close freed the segment; the recovery reopened one and did not apply the codec, so
+    // the next video media frame sees a disabled codec and applies it again.
+    EXPECT_TRUE(muxer.is_segment_open());
+    if (muxer.current_) {
+        EXPECT_EQ(SrsVideoCodecIdDisabled, muxer.latest_vcodec());
+        EXPECT_EQ(SrsVideoCodecIdForbidden, muxer.latest_vcodec_);
+    }
+
+    muxer.segment_close();
+    muxer.on_unpublish();
+    hls_startup_cleanup(stream);
+}
+
+// The measured startup AAC end must use one consistent decoded sample rate. 8kHz AAC carried with
+// an FLV 44.1k sound-rate tag and 128ms packets is 1024 samples/128ms, not 4096/512ms; the DTS
+// clock itself keeps its existing FLV-rate estimate.
+VOID TEST(HlsMuxerStartupTest, StartupAacEndUsesTheDecodedSampleRate)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-aac-end-8k";
+    hls_startup_cleanup(stream);
+
+    MockAppConfig mock_config;
+    SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+    controller->config_ = &mock_config;
+    HELPER_ASSERT_SUCCESS(controller->initialize());
+
+    MockFmp4SrsRequest req;
+    req.stream_ = stream;
+    HELPER_ASSERT_SUCCESS(controller->on_publish(&req));
+
+    SrsUniquePtr<SrsFormat> format(new SrsFormat());
+    int64_t frame_dts = 0;
+    HELPER_ASSERT_SUCCESS(hls_startup_one_aac_frame(controller.get(), format.get(), 128, 11, &frame_dts));
+    EXPECT_EQ(128 * 90, (int)frame_dts);
+
+    controller->dispose();
+    hls_startup_cleanup(stream);
+}
+
+// The ordinary 44.1kHz and 48kHz cases keep the exact frame duration with the decoded rate: 1024
+// samples at 44.1kHz is 2089 ticks, and 1024 samples at 48kHz is 1920 ticks (the FLV 44.1k guess
+// would give 1800 for the 48kHz case).
+VOID TEST(HlsMuxerStartupTest, StartupAacEndKeepsOrdinarySampleRates)
+{
+    struct Case {
+        int timestamp_ms;
+        int rate_index;
+        int expected_dts;
+    };
+    Case cases[] = { { 23, 4, 2089 }, { 21, 3, 1920 } };
+
+    for (int i = 0; i < 2; i++) {
+        srs_error_t err;
+        std::stringstream ss;
+        ss << "hls-startup-aac-end-" << cases[i].rate_index;
+        const std::string stream = ss.str();
+        hls_startup_cleanup(stream);
+
+        MockAppConfig mock_config;
+        SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+        controller->config_ = &mock_config;
+        HELPER_ASSERT_SUCCESS(controller->initialize());
+
+        MockFmp4SrsRequest req;
+        req.stream_ = stream;
+        HELPER_ASSERT_SUCCESS(controller->on_publish(&req));
+
+        SrsUniquePtr<SrsFormat> format(new SrsFormat());
+        int64_t frame_dts = 0;
+        HELPER_ASSERT_SUCCESS(hls_startup_one_aac_frame(controller.get(), format.get(), cases[i].timestamp_ms,
+                                                        cases[i].rate_index, &frame_dts));
+        EXPECT_EQ(cases[i].expected_dts, (int)frame_dts);
+
+        controller->dispose();
+        hls_startup_cleanup(stream);
+    }
+}
+
+// A long fragment keeps a 23s first gap inside one segment, so this measures the frame estimate
+// rather than the overflow reap.
+class MockAppConfigHlsLongFragment : public MockAppConfig
+{
+public:
+    virtual srs_utime_t get_hls_fragment(std::string vhost) { return 60 * SRS_UTIME_SECONDS; }
+};
+
+// The end estimate must not overflow at high decoded rates. 96kHz AAC with a 23s DTS gap
+// multiplies to 2.208e9, beyond INT_MAX; the widened estimate still yields 4096 samples
+// (3840 ticks at 96kHz) instead of a zero duration.
+VOID TEST(HlsMuxerStartupTest, StartupAacEndWidensThe96kEstimate)
+{
+    srs_error_t err;
+    const std::string stream = "hls-startup-aac-end-96k";
+    hls_startup_cleanup(stream);
+
+    MockAppConfigHlsLongFragment mock_config;
+    SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+    controller->config_ = &mock_config;
+    HELPER_ASSERT_SUCCESS(controller->initialize());
+
+    MockFmp4SrsRequest req;
+    req.stream_ = stream;
+    HELPER_ASSERT_SUCCESS(controller->on_publish(&req));
+
+    SrsUniquePtr<SrsFormat> format(new SrsFormat());
+    int64_t frame_dts = 0;
+    HELPER_ASSERT_SUCCESS(hls_startup_one_aac_frame(controller.get(), format.get(), 23000, 0, &frame_dts));
+    EXPECT_EQ(3840, (int)frame_dts);
+
+    controller->dispose();
+    hls_startup_cleanup(stream);
 }

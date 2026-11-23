@@ -203,6 +203,7 @@ SrsTsMessage::SrsTsMessage(SrsTsChannel *c, SrsTsPacket *p)
     ps_helper_ = NULL;
 
     dts_ = pts_ = 0;
+    end_dts_ = 0;
     sid_ = (SrsTsPESStreamId)0x00;
     continuity_counter_ = 0;
     PES_packet_length_ = 0;

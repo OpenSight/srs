@@ -240,6 +240,9 @@ public:
     // The timestamp in 90khz
     int64_t dts_;
     int64_t pts_;
+    // The end timestamp in 90khz of the media in this message. For a cached audio aggregate it is the end of the
+    // last frame, which may be later than dts_. Zero if unknown, in which case dts_ is used.
+    int64_t end_dts_;
     // The id of pes stream to indicates the payload codec.
     // @remark use is_audio() and is_video() to check it, and stream_number() to finger it out.
     SrsTsPESStreamId sid_;
