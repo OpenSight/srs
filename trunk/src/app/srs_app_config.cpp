@@ -2375,8 +2375,8 @@ srs_error_t SrsConfig::check_normal_config()
             if (++bw_limit_count > 1) {
                 return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "duplicate vhost.bw_limit_kbps of %s", vhost_name.c_str());
             }
-            if (conf->args_.size() != 1) {
-                return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "invalid vhost %s bw_limit_kbps, should be one non-negative integer", vhost_name.c_str());
+            if (conf->args_.size() != 1 || !conf->directives_.empty()) {
+                return srs_error_new(ERROR_SYSTEM_CONFIG_INVALID, "invalid vhost %s bw_limit_kbps, should be one non-negative integer without a block", vhost_name.c_str());
             }
 
             string value = conf->arg0();

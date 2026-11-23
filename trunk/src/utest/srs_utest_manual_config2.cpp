@@ -5626,16 +5626,6 @@ VOID TEST(KernelUtilityTest, SecurityAllowRuleWithPrefixLengthOver32_RuleMatches
     sec.config_ = NULL;
 }
 
-// The per-vhost publisher bandwidth limit is a supported vhost directive, so a
-// v6 OpenSight configuration that carries it must validate on v7.
-VOID TEST(BwLimitConfigTest, AcceptDirective)
-{
-    srs_error_t err = srs_success;
-
-    MockSrsConfig conf;
-    HELPER_ASSERT_SUCCESS(conf.mock_parse(_MIN_OK_CONF "vhost ossrs.net{bw_limit_kbps 1000;}"));
-}
-
 // Omitted or zero means the per-vhost publisher bandwidth limit is disabled.
 VOID TEST(BwLimitConfigTest, DefaultDisabled)
 {
@@ -5651,7 +5641,8 @@ VOID TEST(BwLimitConfigTest, DefaultDisabled)
     EXPECT_EQ(0, zero.get_bw_limit_kbps("ossrs.net"));
 }
 
-// The limit is in kbps, as v6 used it, including the largest value the getter can return.
+// The per-vhost publisher bandwidth limit is a supported scalar directive in kbps,
+// as v6 used it, including the largest value the getter can return.
 VOID TEST(BwLimitConfigTest, AcceptValues)
 {
     srs_error_t err = srs_success;
@@ -5675,6 +5666,7 @@ VOID TEST(BwLimitConfigTest, RejectInvalidValues)
     config_expect_refused("vhost ossrs.net{bw_limit_kbps 100k;}", "invalid vhost ossrs.net bw_limit_kbps=100k");
     config_expect_refused("vhost ossrs.net{bw_limit_kbps 1.5;}", "invalid vhost ossrs.net bw_limit_kbps=1.5");
     config_expect_refused("vhost ossrs.net{bw_limit_kbps 1 2;}", "invalid vhost ossrs.net bw_limit_kbps");
+    config_expect_refused("vhost ossrs.net{bw_limit_kbps 200 { arbitrary ignored; }}", "invalid vhost ossrs.net bw_limit_kbps");
     config_expect_refused("vhost ossrs.net{bw_limit_kbps -1;}", "invalid vhost ossrs.net bw_limit_kbps=-1");
     config_expect_refused("vhost ossrs.net{bw_limit_kbps 2147483648;}", "invalid vhost ossrs.net bw_limit_kbps=2147483648");
     config_expect_refused("vhost ossrs.net{bw_limit_kbps 999999999999999999999;}", "invalid vhost ossrs.net bw_limit_kbps=999999999999999999999");

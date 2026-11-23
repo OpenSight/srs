@@ -243,7 +243,6 @@ SrsRtmpConn::SrsRtmpConn(ISrsRtmpTransport *transport, string cip, int cport)
 
     publish_1stpkt_timeout_ = 0;
     publish_normal_timeout_ = 0;
-    bw_limit_kbps_ = 0;
 
     app_factory_ = _srs_app_factory;
     config_ = _srs_config;
@@ -1033,8 +1032,8 @@ srs_error_t SrsRtmpConn::do_publishing(SrsSharedPtr<SrsLiveSource> source, SrsPu
     publish_1stpkt_timeout_ = config_->get_publish_1stpkt_timeout(req->vhost_);
     publish_normal_timeout_ = config_->get_publish_normal_timeout(req->vhost_);
     srs_utime_t publish_kickoff_for_idle = config_->get_publish_kickoff_for_idle(req->vhost_);
-    // Read the limit once for this publishing session, as v6 did, so a reload cannot change it mid-stream.
-    bw_limit_kbps_ = config_->get_bw_limit_kbps(req->vhost_);
+    // Snapshot the limit once for this publishing session, as v6 did, so a reload cannot change it mid-stream.
+    const int bw_limit_kbps = config_->get_bw_limit_kbps(req->vhost_);
 
     // set the sock options.
     set_sock_options();
@@ -1100,16 +1099,21 @@ srs_error_t SrsRtmpConn::do_publishing(SrsSharedPtr<SrsLiveSource> source, SrsPu
         }
         nb_audio_frames = rtrd->nb_audio_frames();
 
-        // Sample on every wakeup, so the bandwidth limit does not depend on pithy logging.
-        kbps_->sample();
-        if (bw_limit_kbps_ > 0 && kbps_->get_recv_kbps_30s() > bw_limit_kbps_) {
-            srs_warn("Publish bandwidth %d kbps exceeds the limit %d kbps", kbps_->get_recv_kbps_30s(), bw_limit_kbps_);
+        // Evaluate the pithy print once, and use it both for the existing cadence when the
+        // policy is disabled and for the log below. When the policy is enabled, sample on
+        // every wakeup so the check does not depend on pithy logging.
+        bool can_print = pprint->can_print();
+        if (bw_limit_kbps > 0 || can_print) {
+            kbps_->sample();
+        }
+        if (bw_limit_kbps > 0 && kbps_->get_recv_kbps_30s() > bw_limit_kbps) {
+            srs_warn("Publish bandwidth %d kbps exceeds the limit %d kbps", kbps_->get_recv_kbps_30s(), bw_limit_kbps);
             return srs_error_new(ERROR_SYSTEM_BANDWIDTH_DENIED, "rtmp: bandwidth limit reached, recv=%dkbps, limit=%dkbps",
-                                 kbps_->get_recv_kbps_30s(), bw_limit_kbps_);
+                                 kbps_->get_recv_kbps_30s(), bw_limit_kbps);
         }
 
         // reportable
-        if (pprint->can_print()) {
+        if (can_print) {
             bool mr = config_->get_mr_enabled(req->vhost_);
             srs_utime_t mr_sleep = config_->get_mr_sleep(req->vhost_);
             srs_trace("<- " SRS_CONSTS_LOG_CLIENT_PUBLISH " time=%d, okbps=%d,%d,%d, ikbps=%d,%d,%d, mr=%d/%d, p1stpt=%d, pnt=%d",
