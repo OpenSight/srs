@@ -34,6 +34,7 @@ class ISrsAppConfig;
 class ISrsHttpHooks;
 class SrsSimpleStream;
 class SrsTsAacJitter;
+class SrsTsMessage;
 class SrsTsMessageCache;
 class SrsHlsSegment;
 class SrsTsContext;
@@ -63,6 +64,13 @@ public:
     // Whether the segment is encrypted with iv_, so the m3u8 writes its key. A segment of a publish without keys is
     // not, even when a reload turns keys on while it is still in the window.
     bool encrypted_;
+    // Whether this segment starts a new track set, so the m3u8 writes a discontinuity before it even when no sequence
+    // header arrived in it. Set at the first video media frame of a publish when the previous entry was audio-only.
+    bool discontinuity_;
+    // Whether this is the first video-bearing segment after an audio-only entry. The pending startup AAC written into
+    // it may end after the first video DTS, so its measured span can be larger than the video timestamp suggests, and
+    // it is kept when that span is positive even below the normal minimum duration.
+    bool startup_video_;
     // The full key path.
     std::string keypath_;
 
@@ -232,6 +240,10 @@ public:
                                       std::string key_file, std::string key_file_path, std::string key_url) = 0;
     virtual srs_error_t segment_open() = 0;
     virtual srs_error_t on_sequence_header() = 0;
+    // Apply the video codec at the first video media frame. If the current segment already holds audio media, it is
+    // finalized as its own audio-only entry and a new segment starts with the codec and a track-change discontinuity,
+    // so the first video-bearing segment's first PMT advertises the real codec.
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec) = 0;
     virtual srs_error_t flush_audio(SrsTsMessageCache *cache) = 0;
     virtual srs_error_t flush_video(SrsTsMessageCache *cache) = 0;
     virtual void update_duration(uint64_t dts) = 0;
@@ -323,6 +335,22 @@ SRS_DECLARE_PRIVATE: // clang-format on
     // Latest audio codec, parsed from stream.
     SrsVideoCodecId latest_vcodec_;
 
+    // Whether any TS packet has been written to the current segment. Until then the segment can adopt the video
+    // codec, so its initial PMT advertises the real codec.
+    bool current_written_;
+    // Whether video media has been written in this publish session. From then on the segment is established: a later
+    // codec change keeps the media already written and uses the regular PMT refresh. Reset when a new publish starts.
+    bool video_written_in_publish_;
+    // The sanitized start and high-water end in milliseconds of the audio media successfully written into the current
+    // segment, or -1 before any audio write. The end is the end of the last written AAC frame. An audio-only segment
+    // finalized before the first video frame reports the exact span of the audio it actually contains, independent of
+    // any cached audio whose timestamp was already seen but whose media was not written yet.
+    int64_t written_audio_start_ms_;
+    int64_t written_audio_end_ms_;
+    // Whether the last published segment was audio-only. The first video-bearing segment after it starts a new track
+    // set and needs a discontinuity, even when it is opened empty after a normal reap.
+    bool last_segment_audio_only_;
+
 public:
     SrsHlsMuxer();
     virtual ~SrsHlsMuxer();
@@ -370,6 +398,11 @@ SRS_DECLARE_PRIVATE: // clang-format on
 
 public:
     virtual srs_error_t on_sequence_header();
+    // Apply the video codec at the first video media frame. An unwritten segment adopts the codec. A segment holding
+    // only audio written before the video media is finalized as its own audio-only entry, with its duration set to
+    // the exact span of its written AAC frames, and the next segment starts with the codec and a track-change
+    // discontinuity. An established segment with video media keeps its media and uses the regular PMT refresh.
+    virtual srs_error_t update_video_codec(SrsVideoCodecId vcodec);
     // Whether segment overflow,
     // that is whether the current segment duration>=(the segment in config)
     virtual bool is_segment_overflow();
@@ -393,8 +426,12 @@ public:
 
 // clang-format off
 SRS_DECLARE_PRIVATE: // clang-format on
-    virtual srs_error_t do_segment_close();
-    virtual srs_error_t do_segment_close2();
+    // Close segment(ts). When keep_short is set, an audio-only segment shorter than the normal minimum duration is
+    // still advertised so its already written media is retained; an oversized (corrupt timestamp) segment is still
+    // dropped. Also clear the retained audio of the closed segment.
+    virtual srs_error_t segment_close(bool keep_short);
+    virtual srs_error_t do_segment_close(bool keep_short);
+    virtual srs_error_t do_segment_close2(bool keep_short = false);
     virtual srs_error_t write_hls_key();
     virtual srs_error_t refresh_m3u8();
     virtual srs_error_t do_refresh_m3u8(std::string m3u8_file);

@@ -2193,3 +2193,40 @@ VOID TEST(HlsTest, DisposedThenUnpublishedStaysOff)
     EXPECT_EQ(0, mock_controller->write_video_count_);
     EXPECT_EQ(0, mock_hub.on_hls_request_sh_count_);
 }
+
+// The TS HLS controller defers the video codec from a sequence header to the first video media
+// frame, so audio written before it keeps an audio-only PMT and its audio PCR.
+VOID TEST(HlsMuxerStartupTest, ControllerDefersVideoCodecToVideoMedia)
+{
+    srs_error_t err;
+
+    MockAppConfig mock_config;
+    SrsUniquePtr<SrsHlsController> controller(new SrsHlsController());
+    controller->config_ = &mock_config;
+    HELPER_ASSERT_SUCCESS(controller->initialize());
+
+    SrsHlsMuxer *muxer = dynamic_cast<SrsHlsMuxer *>(controller->muxer_);
+    ASSERT_TRUE(muxer != NULL);
+
+    MockHlsRequest mock_request("test.vhost", "live", "startup-defer");
+    HELPER_ASSERT_SUCCESS(controller->on_publish(&mock_request));
+
+    SrsUniquePtr<SrsFormat> format(new SrsFormat());
+    format->vcodec_ = new SrsVideoCodecConfig();
+    format->vcodec_->id_ = SrsVideoCodecIdHEVC;
+    format->video_ = new SrsParsedVideoPacket();
+    format->video_->avc_packet_type_ = SrsVideoAvcFrameTraitSequenceHeader;
+
+    SrsUniquePtr<SrsMediaPacket> msg(new SrsMediaPacket());
+    msg->message_type_ = SrsFrameTypeVideo;
+
+    // The header only marks the segment; the codec is applied at the first video media frame so
+    // audio written before it keeps an audio-only PMT and its audio PCR.
+    HELPER_ASSERT_SUCCESS(controller->on_sequence_header(msg.get(), format.get()));
+    EXPECT_EQ(SrsVideoCodecIdDisabled, muxer->latest_vcodec());
+    ASSERT_TRUE(muxer->current_ != NULL);
+    EXPECT_TRUE(muxer->current_->is_sequence_header());
+
+    controller->on_unpublish();
+    controller->dispose();
+}

@@ -99,6 +99,8 @@ SrsHlsSegment::SrsHlsSegment(SrsTsContext *c, SrsAudioCodecId ac, SrsVideoCodecI
     tscw_ = new SrsTsContextWriter(writer_, c, ac, vc);
     memset(iv_, 0, 16);
     encrypted_ = false;
+    discontinuity_ = false;
+    startup_video_ = false;
 }
 
 SrsHlsSegment::~SrsHlsSegment()
@@ -1319,6 +1321,11 @@ SrsHlsMuxer::SrsHlsMuxer()
     segments_ = new SrsFragmentWindow();
     latest_acodec_ = SrsAudioCodecIdForbidden;
     latest_vcodec_ = SrsVideoCodecIdForbidden;
+    current_written_ = false;
+    video_written_in_publish_ = false;
+    written_audio_start_ms_ = -1;
+    written_audio_end_ms_ = -1;
+    last_segment_audio_only_ = false;
 
     memset(key_, 0, 16);
     memset(iv_, 0, 16);
@@ -1432,6 +1439,86 @@ void SrsHlsMuxer::set_latest_vcodec(SrsVideoCodecId v)
     latest_vcodec_ = v;
 }
 
+srs_error_t SrsHlsMuxer::update_video_codec(SrsVideoCodecId vcodec)
+{
+    srs_error_t err = srs_success;
+
+    if (latest_vcodec() == vcodec) {
+        return err;
+    }
+
+    // No TS packet has been written yet, so the current segment will emit its initial PMT with the codec we just
+    // learned from the first video media frame. If the previous published entry was audio-only, this entry starts a
+    // new track set, which needs a discontinuity even though nothing was written into it before this frame.
+    if (!current_ || !current_written_) {
+        if (current_ && last_segment_audio_only_) {
+            current_->discontinuity_ = true;
+            current_->startup_video_ = true;
+        }
+        set_latest_vcodec(vcodec);
+        return err;
+    }
+
+    // Once real video media has been written in this publish, the segment is established. A later codec change keeps
+    // that media and uses the regular PMT refresh.
+    if (video_written_in_publish_) {
+        set_latest_vcodec(vcodec);
+        return err;
+    }
+
+    // The current segment holds only audio written before the first video media frame, so its initial PMT already
+    // advertises audio only. Finalize it as its own audio-only entry and start the video codec in the next segment, so
+    // the first video-bearing segment's first PMT advertises the real codec.
+    //
+    // The duration of the audio-only entry is the exact span of the audio actually written into it, measured to the
+    // end of the last AAC frame. Its aggregate start DTS understates the media, and the first video timestamp is later
+    // than the audio, so neither may be used. Cached audio whose timestamp was already seen but whose media was not
+    // written yet may have extended the duration, so set it to the written span relative to the segment start. If no
+    // measured span is available, keep the media in this segment and let the regular PMT refresh advertise the codec
+    // rather than publish a zero or understated entry.
+    int64_t written_span_ms = 0;
+    if (written_audio_start_ms_ >= 0 && written_audio_end_ms_ > written_audio_start_ms_) {
+        written_span_ms = written_audio_end_ms_ - written_audio_start_ms_;
+    }
+    if (written_span_ms > 0) {
+        int64_t start_ms = (int64_t)(current_->get_start_dts() / SRS_UTIME_MILLISECONDS);
+        current_->append(start_ms + written_span_ms);
+    }
+    if (current_->duration() <= 0) {
+        srs_warn("hls: keep unmeasured audio segment for video codec %d(%s)",
+                 vcodec, srs_video_codec_id2str(vcodec).c_str());
+        set_latest_vcodec(vcodec);
+        return err;
+    }
+
+    srs_trace("hls: close audio-only segment for video codec %d(%s), duration=%dms",
+              vcodec, srs_video_codec_id2str(vcodec).c_str(), srsu2msi(current_->duration()));
+
+    if ((err = segment_close(true)) != srs_success) {
+        // A close failure still frees the segment. Reopen one for the next packet to write, as the normal reap does;
+        // the codec is applied again at the next video media frame because it is not set on this path.
+        srs_error_t r0 = segment_open();
+        if (r0 != srs_success) {
+            srs_warn("close segment err %s", srs_error_desc(r0).c_str());
+            srs_freep(r0);
+        }
+
+        return srs_error_wrap(err, "hls: close audio-only segment");
+    }
+
+    set_latest_vcodec(vcodec);
+
+    if ((err = segment_open()) != srs_success) {
+        return srs_error_wrap(err, "hls: open segment for video codec");
+    }
+
+    // The audio-only entry was just published and this entry starts a new track set, so it needs a discontinuity.
+    current_->discontinuity_ = true;
+    current_->startup_video_ = true;
+
+    return err;
+}
+
 // CRITICAL: This method is called AFTER the source has been added to the source pool
 // in the fetch_or_create pattern (see PR 4449).
 //
@@ -1446,6 +1533,16 @@ srs_error_t SrsHlsMuxer::initialize()
 srs_error_t SrsHlsMuxer::on_publish(ISrsRequest *req)
 {
     srs_error_t err = srs_success;
+
+    // Codec knowledge of a publication must not leak into the next one: a republish whose first segment is audio-only
+    // would otherwise advertise the previous video codec and place PCR on a video PID it never writes. Keep the audio
+    // codec, which is the codec of any audio message still cached by the controller and flushed into the new segment;
+    // the first audio frame of the new publication refreshes it before that frame is written.
+    latest_vcodec_ = SrsVideoCodecIdForbidden;
+    current_written_ = false;
+    video_written_in_publish_ = false;
+    written_audio_start_ms_ = -1;
+    written_audio_end_ms_ = -1;
 
     if ((err = async_->start()) != srs_success) {
         return srs_error_wrap(err, "async start");
@@ -1799,6 +1896,10 @@ srs_error_t SrsHlsMuxer::segment_open()
     // reset the context for a new ts start.
     context_->reset();
 
+    current_written_ = false;
+    written_audio_start_ms_ = -1;
+    written_audio_end_ms_ = -1;
+
     return err;
 }
 
@@ -1942,6 +2043,24 @@ srs_error_t SrsHlsMuxer::flush_audio(SrsTsMessageCache *cache)
     if ((err = current_->tscw_->write_audio(cache->audio_)) != srs_success) {
         return srs_error_wrap(err, "hls: write audio");
     }
+    current_written_ = true;
+
+    // Record the span of the audio actually written. The end of the last AAC frame may be later than the aggregate's
+    // start DTS, which is all that update_duration receives, so an audio-only segment finalized before the first
+    // video frame uses this measured span for its duration. Keep the end as a high-water mark: a later cached message
+    // whose timing moves backward must not shrink the media already written.
+    int64_t start_ms = SrsFragment::sanitize_dts(cache->audio_->dts_ / 90);
+    int64_t end_dts = cache->audio_->end_dts_ > cache->audio_->dts_ ? cache->audio_->end_dts_ : cache->audio_->dts_;
+    int64_t end_ms = SrsFragment::sanitize_dts(end_dts / 90);
+    if (end_ms < start_ms) {
+        end_ms = start_ms;
+    }
+    if (written_audio_start_ms_ < 0 || start_ms < written_audio_start_ms_) {
+        written_audio_start_ms_ = start_ms;
+    }
+    if (end_ms > written_audio_end_ms_) {
+        written_audio_end_ms_ = end_ms;
+    }
 
     // write success, clear and free the msg
     srs_freep(cache->audio_);
@@ -1971,6 +2090,8 @@ srs_error_t SrsHlsMuxer::flush_video(SrsTsMessageCache *cache)
     if ((err = current_->tscw_->write_video(cache->video_)) != srs_success) {
         return srs_error_wrap(err, "hls: write video");
     }
+    current_written_ = true;
+    video_written_in_publish_ = true;
 
     // write success, clear and free the msg
     srs_freep(cache->video_);
@@ -1989,7 +2110,12 @@ void SrsHlsMuxer::update_duration(uint64_t dts)
 
 srs_error_t SrsHlsMuxer::segment_close()
 {
-    srs_error_t err = do_segment_close();
+    return segment_close(false);
+}
+
+srs_error_t SrsHlsMuxer::segment_close(bool keep_short)
+{
+    srs_error_t err = do_segment_close(keep_short);
 
     // We always cleanup current segment.
     srs_freep(current_);
@@ -1997,7 +2123,7 @@ srs_error_t SrsHlsMuxer::segment_close()
     return err;
 }
 
-srs_error_t SrsHlsMuxer::do_segment_close()
+srs_error_t SrsHlsMuxer::do_segment_close(bool keep_short)
 {
     srs_error_t err = srs_success;
 
@@ -2006,7 +2132,7 @@ srs_error_t SrsHlsMuxer::do_segment_close()
         return err;
     }
 
-    if ((err = do_segment_close2()) != srs_success) {
+    if ((err = do_segment_close2(keep_short)) != srs_success) {
         return srs_error_wrap(err, "hls: do segment close");
     }
 
@@ -2027,7 +2153,7 @@ srs_error_t SrsHlsMuxer::do_segment_close()
     return err;
 }
 
-srs_error_t SrsHlsMuxer::do_segment_close2()
+srs_error_t SrsHlsMuxer::do_segment_close2(bool keep_short)
 {
     srs_error_t err = srs_success;
 
@@ -2039,11 +2165,27 @@ srs_error_t SrsHlsMuxer::do_segment_close2()
         current_->writer_->close();
     }
 
+    // The first video-bearing segment after an audio-only entry may carry the pending startup AAC, whose last frame
+    // can end after the first video DTS. When the video timestamp alone leaves the segment below the normal minimum,
+    // use the measured end of the AAC actually written into it, so the real media span is not dropped as too short.
+    if (current_->startup_video_ && current_->duration() < SRS_HLS_SEGMENT_MIN_DURATION && written_audio_end_ms_ > 0) {
+        int64_t start_ms = (int64_t)(current_->get_start_dts() / SRS_UTIME_MILLISECONDS);
+        int64_t span_ms = written_audio_end_ms_ - start_ms;
+        if (span_ms > 0 && span_ms > (int64_t)srsu2msi(current_->duration())) {
+            current_->append(start_ms + span_ms);
+        }
+    }
+
     // valid, add to segments if segment duration is ok
     // when too small, it maybe not enough data to play.
     // when too large, it maybe timestamp corrupt.
     // make the segment more acceptable, when in [min, max_td * 3], it's ok.
-    bool matchMinDuration = current_->duration() >= SRS_HLS_SEGMENT_MIN_DURATION;
+    // An audio-only segment finalized to keep its already written startup audio may be shorter than the normal minimum,
+    // and so may the first video segment whose measured span is the pending AAC, but an oversized (corrupt timestamp)
+    // segment is still dropped. A startup video segment with no remaining AAC and no measured span has zero duration
+    // and keeps the ordinary drop policy.
+    bool matchMinDuration = keep_short || current_->duration() >= SRS_HLS_SEGMENT_MIN_DURATION ||
+                            (current_->startup_video_ && current_->duration() > 0);
     bool matchMaxDuration = current_->duration() <= max_td_ * 3 * 1000;
     if (matchMinDuration && matchMaxDuration) {
         // rename from tmp to real path
@@ -2061,6 +2203,10 @@ srs_error_t SrsHlsMuxer::do_segment_close2()
         if ((err = async_->execute(new SrsDvrAsyncCallOnHlsNotify(_srs_context->get_id(), req_, current_->uri_))) != srs_success) {
             return srs_error_wrap(err, "segment close");
         }
+
+        // Remember the track set of the last published entry, so the first video-bearing segment after an audio-only
+        // entry is marked as a track change even when a normal reap opened it empty.
+        last_segment_audio_only_ = current_->tscw_ && current_->tscw_->vcodec() == SrsVideoCodecIdDisabled;
 
         // close the muxer of finished segment.
         srs_freep(current_->tscw_);
@@ -2218,7 +2364,9 @@ srs_error_t SrsHlsMuxer::do_refresh_m3u8_segment(SrsHlsSegment *segment, std::st
 {
     srs_error_t err = srs_success;
 
-    if (segment->is_sequence_header()) {
+    // The sequence header marks a new decoding timeline; discontinuity_ marks a new track set, such as the first
+    // entry that carries video after an audio-only entry. Either one writes a single discontinuity tag.
+    if (segment->is_sequence_header() || segment->discontinuity_) {
         // #EXT-X-DISCONTINUITY\n
         ss << "#EXT-X-DISCONTINUITY" << SRS_CONSTS_LF;
     }
@@ -2411,6 +2559,8 @@ srs_error_t SrsHlsController::on_unpublish()
 // LCOV_EXCL_START
 srs_error_t SrsHlsController::on_sequence_header(SrsMediaPacket *msg, SrsFormat *format)
 {
+    // A video sequence header only marks the segment for the discontinuity; the codec is applied at the first video
+    // media frame, so an audio-only segment keeps its audio-only PMT and its audio PCR until video media arrives.
     // TODO: support discontinuity for the same stream
     // currently we reap and insert discontinity when encoder republish,
     // but actually, event when stream is not republish, the
@@ -2436,7 +2586,7 @@ srs_error_t SrsHlsController::write_audio(SrsMediaPacket *shared_audio, SrsForma
     int diff = ::abs((int)(shared_audio->timestamp_ - previous_audio_dts_));
     previous_audio_dts_ = shared_audio->timestamp_;
 
-    // Guess the number of samples for each AAC frame.
+    // Guess the number of samples for each AAC frame, for the DTS clock which keeps the coarse FLV rate.
     // If samples is 1024, the sample-rate is 8000HZ, the diff should be 1024/8000s=128ms.
     // If samples is 1024, the sample-rate is 44100HZ, the diff should be 1024/44100s=23ms.
     // If samples is 2048, the sample-rate is 44100HZ, the diff should be 2048/44100s=46ms.
@@ -2475,6 +2625,43 @@ srs_error_t SrsHlsController::write_audio(SrsMediaPacket *shared_audio, SrsForma
     if ((err = tsmc_->cache_audio(frame, dts)) != srs_success) {
         return srs_error_wrap(err, "hls: cache audio");
     }
+
+    // Record the end of the frame in the cached message. A pure-audio segment finalized before the first video media
+    // frame reports this measured end instead of the aggregate start DTS, which may be earlier by a whole aggregate.
+    int64_t frame_duration = 0;
+    if (frame->acodec()->id_ == SrsAudioCodecIdAAC) {
+        // Use the AAC sample rate from the decoded sequence header when it is valid, which is more precise than the
+        // coarse FLV rate index, and fall back to the FLV rate only when the header did not provide one.
+        int sample_rate = 0;
+        if (format->acodec_->aac_sample_rate_ < SrsAAcSampleRateNumbers) {
+            sample_rate = srs_aac_srates[format->acodec_->aac_sample_rate_];
+        }
+        if (sample_rate <= 0) {
+            sample_rate = srs_flv_srates[format->acodec_->sound_rate_];
+        }
+
+        // Estimate the frame size with the same rate that divides the duration. The DTS clock above keeps its existing
+        // FLV-rate estimate, but the measured end must not mix a FLV-rate frame size with a decoded-rate duration:
+        // 8kHz AAC carried with an FLV 44.1k tag and 128ms packets is 1024 samples/128ms, not 4096/512ms.
+        // Widen the multiplication: 96kHz with a 23s gap is 2.208e9, beyond the range of a signed int.
+        int end_samples_per_frame = 0;
+        int64_t end_guess = (int64_t)diff * sample_rate / 1000;
+        if (end_guess > 0) {
+            if (end_guess < 960) {
+                end_samples_per_frame = 960;
+            } else if (end_guess < 1536) {
+                end_samples_per_frame = 1024;
+            } else if (end_guess < 3072) {
+                end_samples_per_frame = 2048;
+            } else {
+                end_samples_per_frame = 4096;
+            }
+        }
+        if (sample_rate > 0 && end_samples_per_frame > 0) {
+            frame_duration = 90000LL * end_samples_per_frame / sample_rate;
+        }
+    }
+    tsmc_->audio_->end_dts_ = dts + frame_duration;
 
     // First, update the duration of the segment, as we might reap the segment. The duration should
     // cover from the first frame to the last frame.
@@ -2517,11 +2704,31 @@ srs_error_t SrsHlsController::write_video(SrsMediaPacket *shared_video, SrsForma
     SrsParsedVideoPacket *frame = format->video_;
     int64_t dts = shared_video->timestamp_ * 90;
 
-    // Refresh the codec ASAP.
+    // Whether this is the first video media frame before any video codec was applied in this publish, so the cached
+    // audio is the startup prefix of the segment that is about to carry video.
+    bool startup_audio_prefix = muxer_->pure_audio();
+    bool startup_audio_written = false;
+
+    // Apply the codec at the first video media frame, before the frame is cached, so an audio-only segment written
+    // before it is finalized and the new segment's initial PMT advertises the real codec.
     if (muxer_->latest_vcodec() != frame->vcodec()->id_) {
         srs_trace("HLS: Switch video codec %d(%s) to %d(%s)", muxer_->latest_vcodec(), srs_video_codec_id2str(muxer_->latest_vcodec()).c_str(),
                   frame->vcodec()->id_, srs_video_codec_id2str(frame->vcodec()->id_).c_str());
-        muxer_->set_latest_vcodec(frame->vcodec()->id_);
+        if ((err = muxer_->update_video_codec(frame->vcodec()->id_)) != srs_success) {
+            return srs_error_wrap(err, "hls: update video codec");
+        }
+    }
+
+    // The startup audio cached before the first video media frame belongs to the segment that will carry that frame.
+    // Write it first, so the segment spans the audio's earlier timestamp. Otherwise, if the publisher leaves right
+    // after the first frame, the unpublish flush lowers the segment start to the audio timestamp after the video was
+    // written, which zeroes its duration and drops the entry with both the startup AAC and the first frame. Only the
+    // startup prefix is reordered; established video keeps its existing interleaving.
+    if (startup_audio_prefix && tsmc_->audio_ && tsmc_->audio_->dts_ <= dts) {
+        if ((err = muxer_->flush_audio(tsmc_)) != srs_success) {
+            return srs_error_wrap(err, "hls: flush startup audio");
+        }
+        startup_audio_written = true;
     }
 
     // write video to cache.
@@ -2533,8 +2740,11 @@ srs_error_t SrsHlsController::write_video(SrsMediaPacket *shared_video, SrsForma
     // cover from the first frame to the last frame.
     muxer_->update_duration(tsmc_->video_->dts_);
 
-    // when segment overflow, reap if possible.
-    if (muxer_->is_segment_overflow()) {
+    // When segment overflow, reap if possible. The startup audio and the first video frame must not be separated by
+    // the reap: closing the segment between them would publish an entry that advertises the video PID without any
+    // video PES or PCR, with the track-change marker on that entry. The next video frame reaps normally when the
+    // segment is over the threshold then.
+    if (!startup_audio_written && muxer_->is_segment_overflow()) {
         // do reap ts if any of:
         //      a. wait keyframe and got keyframe.
         //      b. always reap when not wait keyframe.
