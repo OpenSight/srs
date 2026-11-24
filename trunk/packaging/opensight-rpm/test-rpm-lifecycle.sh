@@ -77,6 +77,24 @@ PY
 )
 fi
 
+lock_value() {
+    python3 -I - "$HERE/sources.lock.json" "$@" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in sys.argv[2:]:
+    value = value[key]
+print(value)
+PY
+}
+
+SRS_LICENSE_EXPR=$(lock_value license_expression)
+SRS6_SOURCE_URL=$(lock_value sources srs6 url)
+SRS6_SOURCE_SHA256=$(lock_value sources srs6 sha256)
+SRS7_SOURCE_URL=$(lock_value sources srs7 url)
+SRS7_SOURCE_SHA256=$(lock_value sources srs7 sha256)
+
 # Both directories must hold the same two binary packages, at different
 # releases for the upgrade scenarios.
 for dir in "$RPM_DIR" "$UPGRADE_RPM_DIR"; do
@@ -116,6 +134,11 @@ for scenario in "${SCENARIOS[@]}"; do
         --platform linux/amd64/v2 \
         --network=none \
         --security-opt label=disable \
+        --env "SRS_LICENSE_EXPR=$SRS_LICENSE_EXPR" \
+        --env "SRS6_SOURCE_URL=$SRS6_SOURCE_URL" \
+        --env "SRS6_SOURCE_SHA256=$SRS6_SOURCE_SHA256" \
+        --env "SRS7_SOURCE_URL=$SRS7_SOURCE_URL" \
+        --env "SRS7_SOURCE_SHA256=$SRS7_SOURCE_SHA256" \
         --volume "$HERE:/tests:ro" \
         --volume "$RPM_DIR:/rpms:ro" \
         --volume "$UPGRADE_RPM_DIR:/upgrade:ro" \

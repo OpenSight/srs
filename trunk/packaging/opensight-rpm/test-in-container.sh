@@ -27,6 +27,7 @@ LICENSE_FILES=(
     LICENSE.state-threads
     LICENSE.mpl-1.1
     LICENSE.json-parser
+    CORRESPONDING-SOURCE
 )
 
 parser_license() {
@@ -128,7 +129,8 @@ assert_payload_allowlist() {
         "$license_dir/LICENSE.state-threads" \
         "$license_dir/LICENSE.mpl-1.1" \
         "$license_dir/LICENSE.json-parser" \
-        "$license_dir/LICENSE.$(parser_license "$pkg")" | sort)
+        "$license_dir/LICENSE.$(parser_license "$pkg")" \
+        "$license_dir/CORRESPONDING-SOURCE" | sort)
     actual=$(rpm -ql "$pkg" | sort)
     if [[ $actual != "$expected" ]]; then
         {
@@ -149,13 +151,28 @@ assert_payload_allowlist() {
 }
 
 assert_license_materials() {
-    local pkg=$1 license_dir=/usr/share/licenses/$pkg file
+    local pkg=$1 license_dir=/usr/share/licenses/$pkg file url sha
     local files=("${LICENSE_FILES[@]}" "LICENSE.$(parser_license "$pkg")")
-    assert_eq "$(rpm -q --qf '%{LICENSE}' "$pkg")" "$LICENSE_EXPR"
+    assert_eq "$(rpm -q --qf '%{LICENSE}' "$pkg")" \
+        "${SRS_LICENSE_EXPR:-$LICENSE_EXPR}"
     for file in "${files[@]}"; do
         [[ -s "$license_dir/$file" ]] \
             || fail "$pkg is missing non-empty license material $file"
     done
+    case $pkg in
+        opensight-srs6) url=${SRS6_SOURCE_URL:-}; sha=${SRS6_SOURCE_SHA256:-} ;;
+        opensight-srs7) url=${SRS7_SOURCE_URL:-}; sha=${SRS7_SOURCE_SHA256:-} ;;
+        *) fail "unknown package $pkg" ;;
+    esac
+    [[ -n $url && -n $sha ]] \
+        || fail "test driver did not pass the locked source URL/SHA for $pkg"
+    assert_owned_by "$pkg" "$license_dir/CORRESPONDING-SOURCE"
+    grep -Fq "$url" "$license_dir/CORRESPONDING-SOURCE" \
+        || fail "$pkg corresponding-source notice lacks the locked URL"
+    grep -Fq "$sha" "$license_dir/CORRESPONDING-SOURCE" \
+        || fail "$pkg corresponding-source notice lacks the locked SHA-256"
+    grep -Fq 'rejected by that pin' "$license_dir/CORRESPONDING-SOURCE" \
+        || fail "$pkg corresponding-source notice does not warn that the pin rejects modified bytes"
 }
 
 assert_no_service_or_config() {

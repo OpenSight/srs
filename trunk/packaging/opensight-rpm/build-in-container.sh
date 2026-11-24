@@ -41,7 +41,7 @@ python3 "$packaging/verify-sources.py" \
 rm -rf "$top"
 mkdir -p "$top"/BUILD "$top"/BUILDROOT "$top"/RPMS "$top"/SOURCES "$top"/SPECS "$top"/SRPMS
 
-cp "$packaging/sources.lock.json" "$packaging/verify-sources.py" "$top/SOURCES/"
+cp "$packaging/sources.lock.json" "$packaging/verify-sources.py" "$packaging/render-notice.py" "$top/SOURCES/"
 cp "$packaging"/licenses/*.txt "$top/SOURCES/"
 mapfile -t source_files < <(
     python3 "$packaging/verify-sources.py" \

@@ -39,6 +39,7 @@ Source3:        LGPL-2.1.txt
 Source4:        MPL-1.1.txt
 Source5:        json-parser-BSD-2-Clause.txt
 Source6:        llhttp-MIT.txt
+Source7:        render-notice.py
 ExclusiveArch:  x86_64_v2
 
 BuildRequires:  gcc gcc-c++ make cmake patch perl tar unzip diffutils findutils
@@ -123,6 +124,9 @@ install -D -m 0644 %{SOURCE5} \
     %{buildroot}%{_licensedir}/%{name}/LICENSE.json-parser
 install -D -m 0644 %{SOURCE6} \
     %{buildroot}%{_licensedir}/%{name}/LICENSE.llhttp
+install -d %{buildroot}%{_licensedir}/%{name}
+python3 -I %{SOURCE7} --lock %{SOURCE1} --name srs7 \
+    --out %{buildroot}%{_licensedir}/%{name}/CORRESPONDING-SOURCE
 
 %files
 %defattr(-,root,root,-)
@@ -140,6 +144,7 @@ install -D -m 0644 %{SOURCE6} \
 %license %{_licensedir}/%{name}/LICENSE.mpl-1.1
 %license %{_licensedir}/%{name}/LICENSE.json-parser
 %license %{_licensedir}/%{name}/LICENSE.llhttp
+%license %{_licensedir}/%{name}/CORRESPONDING-SOURCE
 
 %changelog
 * Tue Nov 24 2026 OpenSight <opensource@opensight.cn> - 7.0.218-1

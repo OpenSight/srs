@@ -86,13 +86,22 @@ MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-la
 | `LICENSE.json-parser` | `trunk/src/protocol/srs_protocol_json.cpp` 内嵌的 BSD-2-Clause 声明 |
 | `LICENSE.http-parser` | v6 `trunk/src/protocol/srs_protocol_http_stack.cpp` 内嵌的 Joyent MIT 声明 |
 | `LICENSE.llhttp` | v7 内嵌 llhttp 的 MIT 声明（`licenses/llhttp-MIT.txt`） |
+| `CORRESPONDING-SOURCE` | 对应源码与重链接说明，构建时由 `render-notice.py` 从锁文件生成 |
 
-对应源码与重链接方式：
+对应源码与重链接方式（完整说明见 `CORRESPONDING-SOURCE.md`，每个包也在
+`/usr/share/licenses/<包名>/CORRESPONDING-SOURCE` 安装同一说明）：
 
 - 两个固定归档本身已经包含上述全部第三方源码；`sources.lock.json` 记录了公开 URL、SHA-256 和大小。
-- 每个二进制 RPM 都配套一个 `.src.rpm`，其中包含完整源码归档、spec、锁文件和构建脚本。
-- 修改归档内的第三方源码后，用本目录的 `build-rpms.sh` 重新构建即可重链接；这满足 LGPL/MPL 对对应源码和重链接的要求。
-- 构建与生命周期测试不下载任何未锁定内容；发布前也不假定任何远程 RPM 产物存在。
+- 每个二进制 RPM 都配套一个 `.src.rpm`，其中包含完整源码归档、spec、锁文件、校验器、许可证文本和构建脚本。
+- 提交的锁固定的是**原始字节**：`build-rpms.sh` 会先校验 SHA-256 和大小，修改过的归档会被拒绝。不要指望提交的 pin 接受新字节。
+- 未修改的重链接：下载并校验归档后运行本目录的 `build-rpms.sh --source-dir <目录>`；它使用原始 configure 选项和功能开关。
+- 修改第三方组件后的重链接有两种准确做法：
+  1. 直接解压归档，在 `trunk/3rdparty/` 中修改组件，然后在 `trunk/` 运行原始
+     `./configure` 选项并 `make`；
+  2. 复制整个打包目录到本地工作区，制作自己的替换归档，并在**副本**的
+     `sources.lock.json` 中更新文件名、URL、SHA-256 和大小，再运行副本的
+     `build-rpms.sh`。提交的锁和已发布说明仍固定原始字节。
+- 构建与生命周期测试不下载任何未锁定内容；发布前也不假定任何远程 RPM 产物存在。SRPM 仅本地保留，不发布到 OSS。
 
 ## 构建
 
