@@ -86,6 +86,24 @@ for dir in "$RPM_DIR" "$UPGRADE_RPM_DIR"; do
     done
 done
 
+# The artifacts must record a build root that matches the locked base image;
+# otherwise the hashes identify an unknown userspace, not the reviewed one.
+for dir in "$RPM_DIR" "$UPGRADE_RPM_DIR"; do
+    python3 -I - "$dir/build-info.json" <<'PY' \
+        || die "$dir/build-info.json does not describe the locked build root"
+import json
+import sys
+
+info = json.load(open(sys.argv[1], encoding="utf-8"))
+runtime = info["build"]["runtime"]
+assert runtime["base_image"] == info["build"]["image"]
+assert runtime["base_image_matches_lock"] is True
+assert runtime["os_release"]["ID"] == "almalinux"
+assert runtime["os_release"]["VERSION_ID"] == "10.2"
+assert runtime["glibc_arch"] == "x86_64_v2"
+PY
+done
+
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
     SCENARIOS=("${ALL_SCENARIOS[@]}")
 fi

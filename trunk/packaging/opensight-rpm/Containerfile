@@ -6,6 +6,13 @@
 ARG BASE_IMAGE=quay.io/almalinuxorg/almalinux@sha256:607a7368ceaff7b76991a9d33ca489dcd6f2b699deaa65ef712d7b8d661ddcc3
 FROM ${BASE_IMAGE}
 
+# A global ARG must be re-declared after FROM to be usable in later steps.
+ARG BASE_IMAGE
+
+# Provenance for build-rpms.sh: a reused image must still prove which userspace
+# it was built from.  The value is compared with sources.lock.json build.image.
+LABEL org.opensight.srs.base-image="${BASE_IMAGE}"
+
 # Build dependencies mirror the reviewed LVR SRS build stage.  nasm lives in
 # CRB, as it does in the appliance recipe.
 RUN dnf -y --setopt=install_weak_deps=False install \

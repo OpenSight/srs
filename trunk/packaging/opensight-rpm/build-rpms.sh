@@ -19,6 +19,7 @@ OUT_DIR="$HERE/dist"
 RELEASE=1
 JOBS=${SRS_RPM_JOBS:-$(nproc 2>/dev/null || echo 2)}
 BUILD_IMAGE=1
+ALLOW_UNLOCKED_BASE=0
 
 usage() {
     sed -n '2,12p' "$HERE/build-rpms.sh" | sed 's/^# \{0,1\}//'
@@ -31,6 +32,9 @@ Options:
   --jobs N            Parallel build jobs (default: host CPU count)
   --base-image IMAGE  Override the pinned AlmaLinux base image
   --no-build-image    Reuse an existing builder image tag
+  --allow-unlocked-base
+                      Permit an experimental build whose recorded base does
+                      not match the lock (never for a release)
   --help              Show this help
 EOF
 }
@@ -48,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --jobs) JOBS=$2; shift 2 ;;
         --base-image) BASE_IMAGE=$2; shift 2 ;;
         --no-build-image) BUILD_IMAGE=0; shift ;;
+        --allow-unlocked-base) ALLOW_UNLOCKED_BASE=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -69,7 +74,8 @@ print(lock["build"][sys.argv[2]])
 PY
 }
 
-[[ -n $BASE_IMAGE ]] || BASE_IMAGE=$(lock_field image)
+LOCKED_BASE_IMAGE=$(lock_field image)
+[[ -n $BASE_IMAGE ]] || BASE_IMAGE=$LOCKED_BASE_IMAGE
 PLATFORM=$(lock_field platform)
 ARCH=$(lock_field arch)
 
@@ -91,11 +97,38 @@ if [[ $BUILD_IMAGE == 1 ]]; then
         "$HERE"
 fi
 
+# A tag can be reused or overridden, so ask the image itself which base it was
+# built from.  Never let build-info claim the locked root without this proof.
+ACTUAL_BASE_IMAGE=$("$PODMAN" image inspect \
+    --format '{{ index .Config.Labels "org.opensight.srs.base-image" }}' \
+    "$BUILDER_IMAGE" 2>/dev/null || true)
+[[ -n $ACTUAL_BASE_IMAGE && $ACTUAL_BASE_IMAGE != '<no value>' ]] \
+    || die "builder image $BUILDER_IMAGE has no org.opensight.srs.base-image label; rebuild it"
+BUILDER_IMAGE_ID=$("$PODMAN" image inspect --format '{{.Id}}' "$BUILDER_IMAGE")
+BUILDER_IMAGE_DIGEST=$("$PODMAN" image inspect --format '{{.Digest}}' "$BUILDER_IMAGE" 2>/dev/null || true)
+
+BASE_MATCHES_LOCK=false
+if [[ $ACTUAL_BASE_IMAGE == "$LOCKED_BASE_IMAGE" ]]; then
+    BASE_MATCHES_LOCK=true
+fi
+if [[ $BASE_MATCHES_LOCK == false && $ALLOW_UNLOCKED_BASE == 0 ]]; then
+    die "builder base '$ACTUAL_BASE_IMAGE' does not match the locked base '$LOCKED_BASE_IMAGE'; rebuild from the pinned base or pass --allow-unlocked-base for a non-release experiment"
+fi
+if [[ $BASE_MATCHES_LOCK == false ]]; then
+    echo "warning: building from unlocked base '$ACTUAL_BASE_IMAGE'" >&2
+fi
+echo "== build root: $ACTUAL_BASE_IMAGE (matches lock: $BASE_MATCHES_LOCK) =="
+
 echo "== building RPMs (release $RELEASE, jobs $JOBS, arch $ARCH) =="
 "$PODMAN" run --rm \
     --platform "$PLATFORM" \
     --network=none \
     --security-opt label=disable \
+    --env "SRS_BUILD_BASE_IMAGE=$ACTUAL_BASE_IMAGE" \
+    --env "SRS_BUILD_LOCKED_IMAGE=$LOCKED_BASE_IMAGE" \
+    --env "SRS_BUILD_BASE_MATCHES_LOCK=$BASE_MATCHES_LOCK" \
+    --env "SRS_BUILD_BUILDER_IMAGE_ID=$BUILDER_IMAGE_ID" \
+    --env "SRS_BUILD_BUILDER_IMAGE_DIGEST=$BUILDER_IMAGE_DIGEST" \
     --volume "$HERE:/packaging:ro" \
     --volume "$SOURCE_DIR:/inputs:ro" \
     --volume "$OUT_DIR:/out:rw" \

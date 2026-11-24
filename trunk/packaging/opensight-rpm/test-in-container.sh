@@ -10,6 +10,33 @@ scenario=${1:?usage: test-in-container.sh <scenario>}
 rpm_dir=/rpms
 upgrade_dir=/upgrade
 
+# SPDX expression for everything statically linked into the executable:
+# SRS (MIT), the embedded JSON parser (BSD-2-Clause) and HTTP parser
+# (MIT), OpenSSL/SSLeay, SRT (MPL-2.0), libsrtp and Opus (BSD-3-Clause),
+# FFmpeg (LGPL-2.1-or-later), State Threads (MPL-1.1 OR GPL-2.0-or-later).
+LICENSE_EXPR='MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-later AND (MPL-1.1 OR GPL-2.0-or-later)'
+
+LICENSE_FILES=(
+    LICENSE
+    LICENSE.openssl
+    LICENSE.srt
+    LICENSE.libsrtp
+    LICENSE.ffmpeg
+    LICENSE.lgpl-2.1
+    LICENSE.opus
+    LICENSE.state-threads
+    LICENSE.mpl-1.1
+    LICENSE.json-parser
+)
+
+parser_license() {
+    case "$1" in
+        opensight-srs6) printf 'http-parser\n' ;;
+        opensight-srs7) printf 'llhttp\n' ;;
+        *) fail "unknown package $1" ;;
+    esac
+}
+
 fail() {
     echo "FAIL[$scenario]: $*" >&2
     exit 1
@@ -86,24 +113,49 @@ assert_owned_by() {
 }
 
 assert_payload_allowlist() {
-    local pkg=$1 version_dir=$2 actual expected
+    local pkg=$1 version_dir=$2 actual expected license_dir=/usr/share/licenses/$pkg path
     expected=$(printf '%s\n' \
         /usr/lib/opensight/srs \
         "/usr/lib/opensight/srs/$version_dir" \
         "/usr/lib/opensight/srs/$version_dir/srs" \
-        "/usr/share/licenses/$pkg/LICENSE" | sort)
+        "$license_dir/LICENSE" \
+        "$license_dir/LICENSE.openssl" \
+        "$license_dir/LICENSE.srt" \
+        "$license_dir/LICENSE.libsrtp" \
+        "$license_dir/LICENSE.ffmpeg" \
+        "$license_dir/LICENSE.lgpl-2.1" \
+        "$license_dir/LICENSE.opus" \
+        "$license_dir/LICENSE.state-threads" \
+        "$license_dir/LICENSE.mpl-1.1" \
+        "$license_dir/LICENSE.json-parser" \
+        "$license_dir/LICENSE.$(parser_license "$pkg")" | sort)
     actual=$(rpm -ql "$pkg" | sort)
     if [[ $actual != "$expected" ]]; then
-        diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+        {
+            echo "expected payload:"
+            printf '%s\n' "$expected"
+            echo "actual payload:"
+            printf '%s\n' "$actual"
+        } >&2
         fail "$pkg payload is not the expected allowlist"
     fi
     while IFS= read -r path; do
         case $path in
             /usr/lib/opensight/srs|/usr/lib/opensight/srs/v[67]|/usr/lib/opensight/srs/v[67]/srs) ;;
-            "/usr/share/licenses/$pkg/LICENSE") ;;
+            /usr/share/licenses/"$pkg"/*) ;;
             *) fail "$pkg owns unexpected path: $path" ;;
         esac
     done <<<"$actual"
+}
+
+assert_license_materials() {
+    local pkg=$1 license_dir=/usr/share/licenses/$pkg file
+    local files=("${LICENSE_FILES[@]}" "LICENSE.$(parser_license "$pkg")")
+    assert_eq "$(rpm -q --qf '%{LICENSE}' "$pkg")" "$LICENSE_EXPR"
+    for file in "${files[@]}"; do
+        [[ -s "$license_dir/$file" ]] \
+            || fail "$pkg is missing non-empty license material $file"
+    done
 }
 
 assert_no_service_or_config() {
@@ -149,6 +201,7 @@ assert_both_installed() {
         assert_binary_runs "$pkg"
         assert_owned_by "$pkg" "$(binary_path "$pkg")"
         assert_payload_allowlist "$pkg" "$version_dir"
+        assert_license_materials "$pkg"
         assert_no_service_or_config "$pkg"
         assert_dependencies "$pkg"
         assert_clean_verify "$pkg"
@@ -240,10 +293,6 @@ case $scenario in
         install_pkg "$rpm_dir" opensight-srs6
         install_pkg "$rpm_dir" opensight-srs7
         assert_both_installed
-        for pkg in opensight-srs6 opensight-srs7; do
-            [[ -s "/usr/share/licenses/$pkg/LICENSE" ]] \
-                || fail "$pkg does not install its license notice"
-        done
         ;;
 
     *)

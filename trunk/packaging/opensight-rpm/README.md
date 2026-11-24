@@ -6,7 +6,7 @@
 
 - 本仓库负责：可复现的打包定义、固定输入校验、构建脚本和 RPM 生命周期测试。
 - LVR 负责：安装两个 RPM、systemd 单元、配置校验、按需启动、启动哪个版本以及运维的版本选择。
-- 两个 RPM 只包含各自的版本化可执行文件和许可证声明：
+- 两个 RPM 只包含各自的版本化可执行文件和这些组件要求的许可证/声明文件：
 
 | 包名 | 版本 | 可执行文件 |
 | --- | --- | --- |
@@ -32,7 +32,7 @@
     --extra-flags='-march=x86-64-v2 -mtune=generic'
 ```
 
-SRS 自身生成 `-g -O0`，因此 RPM 构建不额外注入 `-O2`。源包中的 3rdparty（ST、SRT、SRTP、OpenSSL、FFmpeg）均已随归档提供；容器运行阶段使用 `--network=none`，不下载未锁定内容。
+SRS 自身生成 `-g -O0`，因此 RPM 构建不额外注入 `-O2`。源包中的 3rdparty（ST、SRT、libsrtp、OpenSSL、FFmpeg、Opus）均已随归档提供；容器运行阶段使用 `--network=none`，不下载未锁定内容。
 
 ## 输出契约
 
@@ -47,6 +47,53 @@ SRS 自身生成 `-g -O0`，因此 RPM 构建不额外注入 `-O2`。源包中�
 
 动态依赖由 RPM 自动生成，预期只需要 `libc`、`libm`、`libstdc++` 和 `libgcc_s`；两个包之间没有依赖或冲突。RPM 不注册任何 systemd 或配置路径。
 
+## 许可证与对应源码
+
+`/usr/lib/opensight/srs/v{6,7}/srs` 是静态链接的可执行文件。最终链接行包含 SRS 以及归档内自带的 OpenSSL、SRT、libsrtp、FFmpeg、Opus 和 State Threads，因此 RPM 的 `License` 字段和许可证载荷必须覆盖这些组件，不能只声明 SRS 的 MIT：
+
+| 组件 | v6 版本 | v7 版本 | SPDX |
+| --- | --- | --- | --- |
+| SRS | 6.0.184 | 7.0.218 | `MIT` |
+| json-parser（内嵌） | 归档内嵌 | 归档内嵌 | `BSD-2-Clause` |
+| http-parser（内嵌） | 归档内嵌 | — | `MIT` |
+| llhttp（内嵌） | — | 归档内嵌 | `MIT` |
+| OpenSSL / SSLeay | 1.1.1l | 1.1.1l | `OpenSSL` |
+| SRT | 1.5.3 | 1.5.6 | `MPL-2.0` |
+| libsrtp | 2.3.0 | 2.3.0 | `BSD-3-Clause` |
+| FFmpeg | 4.2 | 4.2 | `LGPL-2.1-or-later` |
+| Opus | 1.3.1 | 1.3.1 | `BSD-3-Clause` |
+| State Threads | 1.9.1 | 1.9.1 | `MPL-1.1 OR GPL-2.0-or-later` |
+
+RPM 的 `License` 字段为：
+
+```text
+MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-later AND (MPL-1.1 OR GPL-2.0-or-later)
+```
+
+每个包在 `/usr/share/licenses/<包名>/` 下安装以下文件：
+
+| 文件 | 来源 |
+| --- | --- |
+| `LICENSE` | 归档根目录的 SRS `LICENSE`（MIT） |
+| `LICENSE.openssl` | `trunk/3rdparty/openssl-1.1-fit/LICENSE`（OpenSSL + SSLeay 双许可全文） |
+| `LICENSE.srt` | `trunk/3rdparty/srt-1-fit/LICENSE`（MPL-2.0 全文） |
+| `LICENSE.libsrtp` | `trunk/3rdparty/libsrtp-2-fit/LICENSE` |
+| `LICENSE.ffmpeg` | `trunk/3rdparty/ffmpeg-4-fit/LICENSE.md` |
+| `LICENSE.lgpl-2.1` | 标准 GNU LGPL 2.1 全文（FFmpeg 声明所引用的许可证） |
+| `LICENSE.opus` | `trunk/3rdparty/opus-1.3.1.tar.gz` 内的 `opus-1.3.1/COPYING` |
+| `LICENSE.state-threads` | `trunk/3rdparty/st-srs/LICENSE` |
+| `LICENSE.mpl-1.1` | 标准 Mozilla Public License 1.1 全文（State Threads 声明所引用的许可证） |
+| `LICENSE.json-parser` | `trunk/src/protocol/srs_protocol_json.cpp` 内嵌的 BSD-2-Clause 声明 |
+| `LICENSE.http-parser` | v6 `trunk/src/protocol/srs_protocol_http_stack.cpp` 内嵌的 Joyent MIT 声明 |
+| `LICENSE.llhttp` | v7 内嵌 llhttp 的 MIT 声明（`licenses/llhttp-MIT.txt`） |
+
+对应源码与重链接方式：
+
+- 两个固定归档本身已经包含上述全部第三方源码；`sources.lock.json` 记录了公开 URL、SHA-256 和大小。
+- 每个二进制 RPM 都配套一个 `.src.rpm`，其中包含完整源码归档、spec、锁文件和构建脚本。
+- 修改归档内的第三方源码后，用本目录的 `build-rpms.sh` 重新构建即可重链接；这满足 LGPL/MPL 对对应源码和重链接的要求。
+- 构建与生命周期测试不下载任何未锁定内容；发布前也不假定任何远程 RPM 产物存在。
+
 ## 构建
 
 准备一个包含两个固定归档的目录（LVR 的输入缓存即可），然后：
@@ -58,11 +105,16 @@ SRS 自身生成 `-g -O0`，因此 RPM 构建不额外注入 `-O2`。源包中�
 脚本会：
 
 1. 在宿主机校验两个归档的 SHA-256 和大小；
-2. 用 `Containerfile` 从固定摘要构建 `opensight-srs-rpm-builder:el10.2`；
-3. 在 `--network=none` 的 AlmaLinux 10.2 `x86_64_v2` 容器中运行 `rpmbuild -ba --target x86_64_v2`；
-4. 在 `build-info.json` 中记录产物身份并生成 `SHA256SUMS`。
+2. 用 `Containerfile` 从固定摘要构建 `opensight-srs-rpm-builder:el10.2`，镜像带有 `org.opensight.srs.base-image` 标签；
+3. 读取实际 builder 镜像的标签，要求它与 `sources.lock.json` 的 `build.image` 一致；不一致时拒绝发布构建（实验可用 `--allow-unlocked-base`）；
+4. 在 `--network=none` 的 AlmaLinux 10.2 `x86_64_v2` 容器中运行 `rpmbuild -ba --target x86_64_v2`，并在容器内再次校验 os-release 和 glibc 架构；
+5. 在 `build-info.json` 中记录声明镜像、实际镜像标签、builder 镜像 ID/摘要、os-release 和 glibc 架构，并生成 `SHA256SUMS`。
 
 `--release N` 用于构建同一载荷的新 release（例如升级测试的 `2.el10`）。首次发布使用默认值 `1.el10`。
+
+`--base-image` 和 `--no-build-image` 只改变实际构建根，不会改变记录：`build-info.json` 会如实记录实际标签，并在 `build.runtime.base_image_matches_lock` 标出是否与锁定镜像一致。发布构建必须为 `true`；生命周期测试也会校验这一点。
+
+输出目录不会被清空或删除任何文件。构建先在容器内暂存，然后只覆盖与本 release 对应的精确文件名（两个二进制 RPM、两个 SRPM、`SHA256SUMS`、`build-info.json`）。请为每次发布使用新的输出目录，避免旧 release 文件与新文件混在一起。
 
 > 若宿主机 podman 使用非默认存储配置，先设置 `CONTAINERS_STORAGE_CONF`。脚本本身不修改宿主机存储或镜像。
 

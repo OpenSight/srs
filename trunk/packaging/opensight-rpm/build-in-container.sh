@@ -8,6 +8,27 @@ jobs=${2:?usage: build-in-container.sh <release> <jobs>}
 [[ $release =~ ^[1-9][0-9]*$ ]]
 [[ $jobs =~ ^[1-9][0-9]*$ ]]
 
+# The host passes the identity of the image this container was started from.
+# Refuse to build on a userspace that is not the promised appliance baseline,
+# and keep the recorded build root truthful even for experimental overrides.
+: "${SRS_BUILD_BASE_IMAGE:?build-rpms.sh must pass SRS_BUILD_BASE_IMAGE}"
+: "${SRS_BUILD_LOCKED_IMAGE:?build-rpms.sh must pass SRS_BUILD_LOCKED_IMAGE}"
+: "${SRS_BUILD_BUILDER_IMAGE_ID:?build-rpms.sh must pass SRS_BUILD_BUILDER_IMAGE_ID}"
+: "${SRS_BUILD_BASE_MATCHES_LOCK:?build-rpms.sh must pass SRS_BUILD_BASE_MATCHES_LOCK}"
+
+. /etc/os-release
+[[ ${ID:-} == almalinux ]] \
+    || { echo "error: builder is not AlmaLinux (ID=${ID:-unset})" >&2; exit 1; }
+[[ ${VERSION_ID:-} == 10.2 ]] \
+    || { echo "error: builder is not AlmaLinux 10.2 (VERSION_ID=${VERSION_ID:-unset})" >&2; exit 1; }
+glibc_arch=$(rpm -q --qf '%{ARCH}' glibc)
+[[ $glibc_arch == x86_64_v2 ]] \
+    || { echo "error: glibc arch is $glibc_arch, not x86_64_v2" >&2; exit 1; }
+
+export SRS_BUILD_OS_ID=${ID}
+export SRS_BUILD_OS_VERSION_ID=${VERSION_ID}
+export SRS_BUILD_GLIBC_ARCH=$glibc_arch
+
 packaging=/packaging
 inputs=/inputs
 output=/out
@@ -21,6 +42,7 @@ rm -rf "$top"
 mkdir -p "$top"/BUILD "$top"/BUILDROOT "$top"/RPMS "$top"/SOURCES "$top"/SPECS "$top"/SRPMS
 
 cp "$packaging/sources.lock.json" "$packaging/verify-sources.py" "$top/SOURCES/"
+cp "$packaging"/licenses/*.txt "$top/SOURCES/"
 mapfile -t source_files < <(
     python3 "$packaging/verify-sources.py" \
         --lock "$packaging/sources.lock.json" --source-dir "$inputs" --print-files
@@ -44,20 +66,25 @@ for spec in opensight-srs6 opensight-srs7; do
     rpmbuild -ba "${common_args[@]}" "$top/SPECS/$spec.spec"
 done
 
-mkdir -p "$output"
-rm -f "$output"/*.rpm "$output"/SHA256SUMS "$output"/build-info.json
+# Stage every generated file first.  The mounted output directory belongs to
+# the caller and may contain unrelated files; only the exact artifact names
+# below are ever written there, and nothing is deleted.
+stage=/work/stage
+rm -rf "$stage"
+mkdir -p "$stage"
 
-find "$top/RPMS" "$top/SRPMS" -type f -name '*.rpm' -exec cp '{}' "$output"/ \;
-( cd "$output" && sha256sum ./*.rpm > SHA256SUMS )
+find "$top/RPMS" "$top/SRPMS" -type f -name '*.rpm' -exec cp '{}' "$stage"/ \;
+( cd "$stage" && sha256sum *.rpm > SHA256SUMS )
 
-python3 - "$packaging/sources.lock.json" "$output" "$release" <<'PY'
+python3 - "$packaging/sources.lock.json" "$stage" "$release" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
 
-lock_path, output, release = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
+lock_path, stage, release = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
 lock = json.loads(pathlib.Path(lock_path).read_text(encoding="utf-8"))
 expected = {entry["package"]: entry for entry in lock["sources"].values()}
 
@@ -74,7 +101,7 @@ def query(path, fmt):
     )
 
 records = []
-for path in sorted(output.glob("*.rpm")):
+for path in sorted(stage.glob("*.rpm")):
     name, version, rel, arch, size = query(
         path, "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{SIZE}"
     ).split("\t")
@@ -93,6 +120,7 @@ for path in sorted(output.glob("*.rpm")):
             "installed_size_bytes": int(size),
             "payload": query(path, "[%{FILENAMES}\n]").splitlines(),
             "requires": query(path, "[%{REQUIRENEVRS}\n]").splitlines(),
+            "license": query(path, "%{LICENSE}").strip(),
         }
     )
 
@@ -107,19 +135,34 @@ for record in records:
             f"{record['name']} version {record['version']} != {entry['version']}"
         )
 
+runtime = {
+    "base_image": os.environ["SRS_BUILD_BASE_IMAGE"],
+    "locked_base_image": os.environ["SRS_BUILD_LOCKED_IMAGE"],
+    "base_image_matches_lock": os.environ["SRS_BUILD_BASE_MATCHES_LOCK"] == "true",
+    "builder_image_id": os.environ["SRS_BUILD_BUILDER_IMAGE_ID"],
+    "builder_image_digest": os.environ.get("SRS_BUILD_BUILDER_IMAGE_DIGEST", ""),
+    "os_release": {
+        "ID": os.environ["SRS_BUILD_OS_ID"],
+        "VERSION_ID": os.environ["SRS_BUILD_OS_VERSION_ID"],
+    },
+    "glibc_arch": os.environ["SRS_BUILD_GLIBC_ARCH"],
+}
+
 info = {
     "schema_version": 1,
-    "build": lock["build"],
+    "build": {**lock["build"], "runtime": runtime},
     "release": int(release),
     "sources": lock["sources"],
     "artifacts": records,
 }
-(output / "build-info.json").write_text(
+(stage / "build-info.json").write_text(
     json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
 )
 print(json.dumps(info, indent=2, sort_keys=True))
 PY
 
+mkdir -p "$output"
+install -m 0644 "$stage"/*.rpm "$stage/SHA256SUMS" "$stage/build-info.json" "$output"/
 ( cd "$output" && sha256sum --check SHA256SUMS )
 echo "== built artifacts =="
-ls -l "$output"
+ls -l "$stage"
