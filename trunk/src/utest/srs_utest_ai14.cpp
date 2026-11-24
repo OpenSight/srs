@@ -2973,6 +2973,37 @@ VOID TEST(AppForwarderTest, RejectRtmpsDestination)
     srs_freep(mock_source);
 }
 
+VOID TEST(SrsLiveSourceTest, RtmpTimestampRegressionUsesThePreviousAudioOrVideoPacket)
+{
+    srs_error_t err;
+    SrsLiveSource source;
+    SrsRtmpCommonMessage audio;
+    audio.header_.message_type_ = RTMP_MSG_AudioMessage;
+    SrsRtmpCommonMessage video;
+    video.header_.message_type_ = RTMP_MSG_VideoMessage;
+
+    // Empty payloads keep the test at the timestamp check before media processing.
+    video.header_.timestamp_ = 12000;
+    HELPER_ASSERT_SUCCESS(source.on_video(&video));
+    audio.header_.timestamp_ = 7000;
+    HELPER_ASSERT_SUCCESS(source.on_audio(&audio));
+
+    // The guard also runs before the A/V interleaving queue.
+    source.mix_correct_ = true;
+    video.header_.timestamp_ = 1999;
+    err = source.on_video(&video);
+    EXPECT_EQ(ERROR_SYSTEM_PACKET_INVALID, srs_error_code(err));
+    srs_freep(err);
+    audio.header_.timestamp_ = 1999;
+    err = source.on_audio(&audio);
+    EXPECT_EQ(ERROR_SYSTEM_PACKET_INVALID, srs_error_code(err));
+    srs_freep(err);
+
+    // A rejected packet does not replace the previous timestamp.
+    video.header_.timestamp_ = 2000;
+    HELPER_ASSERT_SUCCESS(source.on_video(&video));
+}
+
 VOID TEST(SrsLiveSourceTest, OnAggregateSelectionTypical)
 {
     srs_error_t err;

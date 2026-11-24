@@ -2138,6 +2138,17 @@ srs_error_t SrsLiveSource::on_meta_data(SrsRtmpCommonMessage *msg, SrsOnMetaData
     return err;
 }
 
+// Match the OpenSight v6 guard: compare against the previous audio or video packet before filtering or mixing.
+static srs_error_t srs_check_rtmp_timestamp(int64_t previous_ms, int64_t current_ms, const char *media)
+{
+    const int64_t max_regression_ms = 5000;
+    if (previous_ms > 0 && current_ms < previous_ms - max_regression_ms) {
+        return srs_error_new(ERROR_SYSTEM_PACKET_INVALID, "%s timestamp regressed from %" PRId64 "ms to %" PRId64 "ms",
+                             media, previous_ms, current_ms);
+    }
+    return srs_success;
+}
+
 srs_error_t SrsLiveSource::on_audio(SrsRtmpCommonMessage *shared_audio)
 {
     // Detect where stream is monotonically increasing.
@@ -2147,6 +2158,10 @@ srs_error_t SrsLiveSource::on_audio(SrsRtmpCommonMessage *shared_audio)
             srs_warn("AUDIO: Timestamp %" PRId64 "=>%" PRId64 ", may need mix_correct.",
                      last_packet_time_, shared_audio->header_.timestamp_);
         }
+    }
+    srs_error_t err = srs_check_rtmp_timestamp(last_packet_time_, shared_audio->header_.timestamp_, "audio");
+    if (err != srs_success) {
+        return err;
     }
     last_packet_time_ = shared_audio->header_.timestamp_;
 
@@ -2285,6 +2300,9 @@ srs_error_t SrsLiveSource::on_video(SrsRtmpCommonMessage *shared_video)
             srs_warn("VIDEO: Timestamp %" PRId64 "=>%" PRId64 ", may need mix_correct.",
                      last_packet_time_, shared_video->header_.timestamp_);
         }
+    }
+    if ((err = srs_check_rtmp_timestamp(last_packet_time_, shared_video->header_.timestamp_, "video")) != srs_success) {
+        return err;
     }
     last_packet_time_ = shared_video->header_.timestamp_;
 
