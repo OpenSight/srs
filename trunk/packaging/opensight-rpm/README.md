@@ -98,9 +98,11 @@ MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-la
 - 修改第三方组件后的重链接有两种准确做法：
   1. 直接解压归档，在 `trunk/3rdparty/` 中修改组件，然后在 `trunk/` 运行原始
      `./configure` 选项并 `make`；
-  2. 复制整个打包目录到本地工作区，制作自己的替换归档，并在**副本**的
-     `sources.lock.json` 中更新文件名、URL、SHA-256 和大小，再运行副本的
-     `build-rpms.sh`。提交的锁和已发布说明仍固定原始字节。
+  2. 复制整个打包目录到本地工作区，制作替换归档；归档必须保持与原固定归档
+     相同的**文件名**（spec 的 `Source0` 是字面值，`%prep` 要求锁定文件名与
+     它一致）和相同的顶层根目录，然后在**副本**的 `sources.lock.json` 中更新
+     URL、SHA-256 和大小（如确实要改名，必须同时改副本 spec 的 `Source0`），
+     再运行副本的 `build-rpms.sh`。提交的锁和已发布说明仍固定原始字节。
 - 构建与生命周期测试不下载任何未锁定内容；发布前也不假定任何远程 RPM 产物存在。SRPM 仅本地保留，不发布到 OSS。
 
 ## 构建
@@ -115,13 +117,13 @@ MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-la
 
 1. 在宿主机校验两个归档的 SHA-256 和大小；
 2. 用 `Containerfile` 从固定摘要构建 `opensight-srs-rpm-builder:el10.2`，镜像带有 `org.opensight.srs.base-image` 标签；
-3. 读取实际 builder 镜像的标签，要求它与 `sources.lock.json` 的 `build.image` 一致；不一致时拒绝发布构建（实验可用 `--allow-unlocked-base`）；
+3. 一次性把 builder 标签解析为不可变镜像 ID，从同一次读取取得标签，要求它与 `sources.lock.json` 的 `build.image` 一致；随后记录该 ID 并用同一个 ID 启动构建容器，避免标签在两次查询之间被替换；不一致时拒绝发布构建（实验可用 `--allow-unlocked-base`）；
 4. 在 `--network=none` 的 AlmaLinux 10.2 `x86_64_v2` 容器中运行 `rpmbuild -ba --target x86_64_v2`，并在容器内再次校验 os-release 和 glibc 架构；
 5. 在 `build-info.json` 中记录声明镜像、实际镜像标签、builder 镜像 ID/摘要、os-release 和 glibc 架构，并生成 `SHA256SUMS`。
 
 `--release N` 用于构建同一载荷的新 release（例如升级测试的 `2.el10`）。首次发布使用默认值 `1.el10`。
 
-`--base-image` 和 `--no-build-image` 只改变实际构建根，不会改变记录：`build-info.json` 会如实记录实际标签，并在 `build.runtime.base_image_matches_lock` 标出是否与锁定镜像一致。发布构建必须为 `true`；生命周期测试也会校验这一点。
+`--base-image` 和 `--no-build-image` 只改变实际构建根，不会改变记录：`build-info.json` 会如实记录实际标签和不可变镜像 ID，并在 `build.runtime.base_image_matches_lock` 标出是否与锁定镜像一致。发布构建必须为 `true`；生命周期测试也会校验这一点。
 
 输出目录不会被清空或删除任何文件。构建先在容器内暂存，然后只覆盖与本 release 对应的精确文件名（两个二进制 RPM、两个 SRPM、`SHA256SUMS`、`build-info.json`）。请为每次发布使用新的输出目录，避免旧 release 文件与新文件混在一起。
 

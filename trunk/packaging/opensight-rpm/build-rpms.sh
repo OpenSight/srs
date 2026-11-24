@@ -97,15 +97,19 @@ if [[ $BUILD_IMAGE == 1 ]]; then
         "$HERE"
 fi
 
-# A tag can be reused or overridden, so ask the image itself which base it was
-# built from.  Never let build-info claim the locked root without this proof.
-ACTUAL_BASE_IMAGE=$("$PODMAN" image inspect \
-    --format '{{ index .Config.Labels "org.opensight.srs.base-image" }}' \
-    "$BUILDER_IMAGE" 2>/dev/null || true)
+# A tag is mutable: it can be retagged or rebuilt between two lookups.  Resolve
+# it exactly once here, then record that immutable image ID as provenance and
+# run that same ID below, so the container cannot differ from what build-info
+# claims.  Never let build-info name the locked root without this proof.
+image_info=$("$PODMAN" image inspect \
+    --format '{{.Id}}|{{ index .Config.Labels "org.opensight.srs.base-image" }}|{{.Digest}}' \
+    "$BUILDER_IMAGE" 2>/dev/null) \
+    || die "cannot inspect builder image $BUILDER_IMAGE"
+IFS='|' read -r BUILDER_IMAGE_ID ACTUAL_BASE_IMAGE BUILDER_IMAGE_DIGEST <<<"$image_info"
+[[ -n $BUILDER_IMAGE_ID ]] \
+    || die "cannot resolve builder image $BUILDER_IMAGE to an immutable ID"
 [[ -n $ACTUAL_BASE_IMAGE && $ACTUAL_BASE_IMAGE != '<no value>' ]] \
     || die "builder image $BUILDER_IMAGE has no org.opensight.srs.base-image label; rebuild it"
-BUILDER_IMAGE_ID=$("$PODMAN" image inspect --format '{{.Id}}' "$BUILDER_IMAGE")
-BUILDER_IMAGE_DIGEST=$("$PODMAN" image inspect --format '{{.Digest}}' "$BUILDER_IMAGE" 2>/dev/null || true)
 
 BASE_MATCHES_LOCK=false
 if [[ $ACTUAL_BASE_IMAGE == "$LOCKED_BASE_IMAGE" ]]; then
@@ -132,7 +136,7 @@ echo "== building RPMs (release $RELEASE, jobs $JOBS, arch $ARCH) =="
     --volume "$HERE:/packaging:ro" \
     --volume "$SOURCE_DIR:/inputs:ro" \
     --volume "$OUT_DIR:/out:rw" \
-    "$BUILDER_IMAGE" \
+    "$BUILDER_IMAGE_ID" \
     /bin/bash /packaging/build-in-container.sh "$RELEASE" "$JOBS"
 
 # Emit the consumer-side lock entries without a URL: no remote artifact is
