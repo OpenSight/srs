@@ -1658,6 +1658,8 @@ type RTMPPublisher struct {
 	client *RTMPClient
 	// Whether auto close transport when ingest done.
 	closeTransportWhenIngestDone bool
+	// Offset in milliseconds when appending a FLV file to an existing publication.
+	flvTimestampOffset uint64
 	// Whether drop audio, set the hasAudio to false.
 	hasAudio bool
 	// Whether drop video, set the hasVideo to false.
@@ -1763,7 +1765,7 @@ func (v *RTMPPublisher) ingestFLV(ctx context.Context, flvInput string) error {
 
 		m := rtmp.NewStreamMessage(p.streamID)
 		m.MessageType = rtmp.MessageType(tagType)
-		m.Timestamp = uint64(timestamp)
+		m.Timestamp = uint64(timestamp) + v.flvTimestampOffset
 		m.Payload = tag
 		if err = p.proto.WriteMessage(m); err != nil {
 			return err

@@ -268,11 +268,40 @@ func TestRtmpPublish_RtspPlay(t *testing.T) {
 	}
 }
 
+func ingestMultipleSequences(ctx context.Context, publisher *RTMPPublisher) error {
+	first, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+
+	var latestTimestamp uint64
+	var videoPackets int
+	publisher.onSendPacket = func(message *rtmp.Message) error {
+		latestTimestamp = max(latestTimestamp, message.Timestamp)
+		if message.MessageType == rtmp.MessageTypeVideo {
+			videoPackets++
+		}
+		if videoPackets > 10 {
+			cancelFirst()
+		}
+		return nil
+	}
+
+	publisher.closeTransportWhenIngestDone = false
+	if err := publisher.Ingest(first, *srsPublishBBB); err != nil {
+		return errors.Wrap(err, "ingest first sequence")
+	}
+
+	// Continue the same publication when switching the SPS/PPS to the second file.
+	publisher.onSendPacket = nil
+	publisher.flvTimestampOffset = latestTimestamp + 1
+	publisher.closeTransportWhenIngestDone = true
+	return publisher.Ingest(ctx, *srsPublishAvatar)
+}
+
 func TestRtmpPublish_MultipleSequences(t *testing.T) {
 	ctx := logger.WithContext(context.Background())
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(*srsTimeout)*time.Millisecond)
 
-	var r0, r1, r2 error
+	var r0, r1 error
 	err := func() error {
 		publisher := NewRTMPPublisher()
 		defer publisher.Close()
@@ -334,32 +363,14 @@ func TestRtmpPublish_MultipleSequences(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var nnPackets int
-			ctxAvatar, cancelAvatar := context.WithCancel(ctx)
-			publisher.onSendPacket = func(m *rtmp.Message) error {
-				if m.MessageType == rtmp.MessageTypeVideo {
-					nnPackets++
-				}
-				if nnPackets > 10 {
-					cancelAvatar()
-				}
-				return nil
-			}
-
-			publisher.closeTransportWhenIngestDone = false
-			if r0 = publisher.Ingest(ctxAvatar, *srsPublishBBB); r0 != nil {
-				cancel()
-			}
-
-			publisher.closeTransportWhenIngestDone = true
-			if r2 = publisher.Ingest(ctx, *srsPublishAvatar); r2 != nil {
+			if r0 = ingestMultipleSequences(ctx, publisher); r0 != nil {
 				cancel()
 			}
 		}()
 
 		return nil
 	}()
-	if err := filterTestError(ctx.Err(), err, r0, r1, r2); err != nil {
+	if err := filterTestError(ctx.Err(), err, r0, r1); err != nil {
 		t.Errorf("err %+v", err)
 	}
 }
@@ -368,7 +379,7 @@ func TestRtmpPublish_MultipleSequences_RtcPlay(t *testing.T) {
 	ctx := logger.WithContext(context.Background())
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(*srsTimeout)*time.Millisecond)
 
-	var r0, r1, r2 error
+	var r0, r1 error
 	err := func() (err error) {
 		streamSuffix := fmt.Sprintf("rtmp-regression-%v-%v", os.Getpid(), rand.Int())
 		rtmpUrl := fmt.Sprintf("%v://%v%v-%v", srsSchema, *srsServer, *srsStream, streamSuffix)
@@ -443,25 +454,7 @@ func TestRtmpPublish_MultipleSequences_RtcPlay(t *testing.T) {
 			case <-playerIceReady.Done():
 			}
 
-			var nnPackets int
-			ctxAvatar, cancelAvatar := context.WithCancel(ctx)
-			publisher.onSendPacket = func(m *rtmp.Message) error {
-				if m.MessageType == rtmp.MessageTypeVideo {
-					nnPackets++
-				}
-				if nnPackets > 10 {
-					cancelAvatar()
-				}
-				return nil
-			}
-
-			publisher.closeTransportWhenIngestDone = false
-			if r0 = publisher.Ingest(ctxAvatar, *srsPublishBBB); r0 != nil {
-				cancel()
-			}
-
-			publisher.closeTransportWhenIngestDone = true
-			if r2 = publisher.Ingest(ctx, *srsPublishAvatar); r2 != nil {
+			if r0 = ingestMultipleSequences(ctx, publisher); r0 != nil {
 				cancel()
 			}
 			logger.Tf(ctx, "publisher done")
@@ -469,7 +462,7 @@ func TestRtmpPublish_MultipleSequences_RtcPlay(t *testing.T) {
 
 		return nil
 	}()
-	if err := filterTestError(ctx.Err(), err, r0, r1, r2); err != nil {
+	if err := filterTestError(ctx.Err(), err, r0, r1); err != nil {
 		t.Errorf("err %+v", err)
 	}
 }
