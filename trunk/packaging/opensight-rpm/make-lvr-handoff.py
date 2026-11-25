@@ -6,9 +6,10 @@ The LVR build consumes the two binary RPMs through the same input contract as
 exact entries, so the consumer does not have to retype hashes or NEVRAs.
 
 Without ``--object-prefix`` the ``url`` field is omitted: no remote artifact is
-assumed to exist.  Once the signed-off RPMs are uploaded to an immutable,
-content-addressed location, pass the prefix and the emitted entries gain the
-``url`` required by LVR's download path.
+assumed to exist.  Once the signed-off RPMs are uploaded, pass the
+``software/srs-rpm`` object prefix and the emitted entries gain the flat
+``<object-prefix>/<actual-rpm-filename>`` URL required by LVR's download path.
+There is no digest directory: one published key identifies one RPM.
 """
 
 from __future__ import annotations
@@ -37,8 +38,18 @@ def main(argv: list[str]) -> int:
         name = artifact.get("name")
         if name not in PACKAGES:
             continue
-        if artifact.get("arch") == "src":
+        # rpmbuild --target stamps the target arch into the source RPM header,
+        # so identify sources by the artifact flag and file suffix, not arch.
+        if (
+            artifact.get("is_source")
+            or artifact.get("arch") == "src"
+            or artifact["file"].endswith(".src.rpm")
+        ):
             continue
+        if artifact["file"] != artifact["nevra"] + ".rpm":
+            raise SystemExit(
+                f"{artifact['file']} does not match its NEVRA {artifact['nevra']}"
+            )
         entry = {
             "file": artifact["file"],
             "sha256": artifact["sha256"],
@@ -54,11 +65,7 @@ def main(argv: list[str]) -> int:
         }
         if args.object_prefix:
             entry["url"] = (
-                args.object_prefix.rstrip("/")
-                + "/"
-                + artifact["sha256"]
-                + "/"
-                + artifact["file"]
+                args.object_prefix.rstrip("/") + "/" + artifact["file"]
             )
         entries[PACKAGES[name]] = entry
 
