@@ -97,6 +97,46 @@ installed_release() {
     rpm -q --qf '%{RELEASE}' "$1"
 }
 
+expected_release() {
+    case "$1" in
+        opensight-srs6) printf '%s\n' "${SRS_BASE_RELEASE_6:?}" ;;
+        opensight-srs7) printf '%s\n' "${SRS_BASE_RELEASE_7:?}" ;;
+        *) fail "unknown package $1" ;;
+    esac
+}
+
+upgrade_release() {
+    case "$1" in
+        opensight-srs6) printf '%s\n' "${SRS_UPGRADE_RELEASE_6:?}" ;;
+        opensight-srs7) printf '%s\n' "${SRS_UPGRADE_RELEASE_7:?}" ;;
+        *) fail "unknown package $1" ;;
+    esac
+}
+
+assert_rpm_identity() {
+    local dir=$1 pkg=$2 file expected actual
+    file=$(rpm_file "$dir" "$pkg")
+    expected=$(basename "$file" .rpm)
+    actual=$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$file")
+    assert_eq "$actual" "$expected"
+}
+
+# rpmvercmp returns 1 when the first release is newer.  This covers both the
+# previous published release (1.el10) and an explicit upgrade release.
+assert_vercmp() {
+    local left=$1 right=$2 expected=$3 result
+    result=$(rpm --eval "%{lua:print(rpm.vercmp('$left', '$right'))}") \
+        || fail "cannot compare releases $left and $right"
+    assert_eq "$result" "$expected"
+}
+
+assert_release_contract() {
+    local pkg=$1 current previous=${SRS_PREVIOUS_RELEASE:?}
+    current=$(installed_release "$pkg")
+    assert_eq "$current" "$(expected_release "$pkg")"
+    assert_vercmp "$current" "$previous" 1
+}
+
 assert_binary_runs() {
     local pkg=$1 binary version
     binary=$(binary_path "$pkg")
@@ -217,6 +257,8 @@ assert_both_installed() {
         assert_arch "$pkg"
         assert_binary_runs "$pkg"
         assert_owned_by "$pkg" "$(binary_path "$pkg")"
+        assert_rpm_identity "$rpm_dir" "$pkg"
+        assert_release_contract "$pkg"
         assert_payload_allowlist "$pkg" "$version_dir"
         assert_license_materials "$pkg"
         assert_no_service_or_config "$pkg"
@@ -267,8 +309,14 @@ case $scenario in
         install_pkg "$rpm_dir" opensight-srs7
         kept_nevra=$(installed_nevra opensight-srs7)
         kept_hash=$(sha256sum "$(binary_path opensight-srs7)" | cut -d' ' -f1)
+        assert_rpm_identity "$upgrade_dir" opensight-srs6
         upgrade_pkg "$upgrade_dir" opensight-srs6
-        assert_eq "$(installed_release opensight-srs6)" "2.el10"
+        assert_eq "$(installed_release opensight-srs6)" \
+            "$(upgrade_release opensight-srs6)"
+        assert_vercmp "$(installed_release opensight-srs6)" \
+            "${SRS_BASE_RELEASE_6:?}" 1
+        assert_vercmp "$(installed_release opensight-srs6)" \
+            "${SRS_PREVIOUS_RELEASE:?}" 1
         assert_eq "$(installed_nevra opensight-srs7)" "$kept_nevra"
         assert_eq "$(sha256sum "$(binary_path opensight-srs7)" | cut -d' ' -f1)" "$kept_hash"
         assert_clean_verify opensight-srs7
@@ -282,8 +330,14 @@ case $scenario in
         install_pkg "$rpm_dir" opensight-srs7
         kept_nevra=$(installed_nevra opensight-srs6)
         kept_hash=$(sha256sum "$(binary_path opensight-srs6)" | cut -d' ' -f1)
+        assert_rpm_identity "$upgrade_dir" opensight-srs7
         upgrade_pkg "$upgrade_dir" opensight-srs7
-        assert_eq "$(installed_release opensight-srs7)" "2.el10"
+        assert_eq "$(installed_release opensight-srs7)" \
+            "$(upgrade_release opensight-srs7)"
+        assert_vercmp "$(installed_release opensight-srs7)" \
+            "${SRS_BASE_RELEASE_7:?}" 1
+        assert_vercmp "$(installed_release opensight-srs7)" \
+            "${SRS_PREVIOUS_RELEASE:?}" 1
         assert_eq "$(installed_nevra opensight-srs6)" "$kept_nevra"
         assert_eq "$(sha256sum "$(binary_path opensight-srs6)" | cut -d' ' -f1)" "$kept_hash"
         assert_clean_verify opensight-srs6
@@ -310,6 +364,13 @@ case $scenario in
         install_pkg "$rpm_dir" opensight-srs6
         install_pkg "$rpm_dir" opensight-srs7
         assert_both_installed
+        # The upgrade artifacts use the real RPM basename and a newer Release.
+        assert_rpm_identity "$upgrade_dir" opensight-srs6
+        assert_rpm_identity "$upgrade_dir" opensight-srs7
+        assert_vercmp "$(upgrade_release opensight-srs6)" \
+            "${SRS_BASE_RELEASE_6:?}" 1
+        assert_vercmp "$(upgrade_release opensight-srs7)" \
+            "${SRS_BASE_RELEASE_7:?}" 1
         ;;
 
     *)

@@ -4,7 +4,7 @@
 # LVR owns systemd units, configuration, logging and version selection.
 #
 # Build with: rpmbuild -bb --target x86_64_v2 \
-#                --define 'opensight_release 1' ...
+#                --define 'opensight_release 1.1.20261125.el10' ...
 # The build must run on AlmaLinux 10.2 x86_64_v2 (see Containerfile).
 
 %global source_root srs-opensight-v6.0
@@ -17,9 +17,12 @@
 # (MPL-1.1 OR GPL-2.0-or-later).
 %global opensight_license MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-later AND (MPL-1.1 OR GPL-2.0-or-later)
 
-# The release is overridable so the lifecycle test can build a newer release
-# of the same payload and exercise an independent upgrade.
-%{!?opensight_release:%global opensight_release 1}
+# Release is <OpenSight source revision>.<packaging revision>.<UTC release
+# date>.<distribution>.  This default matches sources.lock.json so a direct
+# rebuild of this spec or its source RPM reproduces the verified release.  The
+# provider build passes an explicit define (see release.py); the lifecycle test
+# overrides it with a newer packaging revision to exercise an upgrade.
+%{!?opensight_release:%global opensight_release 1.1.20261125.el10}
 
 # Ship no debuginfo and no loader build-id aliases: the package has a closed
 # payload allowlist and must not own paths outside it.
@@ -29,7 +32,7 @@
 
 Name:           opensight-srs6
 Version:        6.0.184
-Release:        %{opensight_release}%{?dist}
+Release:        %{opensight_release}
 Summary:        OpenSight SRS 6 media server executable
 License:        %{opensight_license}
 URL:            https://github.com/OpenSight/srs
@@ -148,5 +151,7 @@ python3 -I %{SOURCE7} --lock %{SOURCE1} --name srs6 \
 %license %{_licensedir}/%{name}/CORRESPONDING-SOURCE
 
 %changelog
+* Wed Nov 25 2026 OpenSight <opensource@opensight.cn> - 6.0.184-1.1.20261125.el10
+- Publish the verified runtime RPM under the OpenSight release convention.
 * Tue Nov 24 2026 OpenSight <opensource@opensight.cn> - 6.0.184-1
 - Package the locked OpenSight SRS 6.0.184 source as a versioned RPM.

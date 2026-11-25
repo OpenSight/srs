@@ -24,6 +24,9 @@
 | `srs6` | 6.0.184 | `srs-opensight-v6.0-20260222.zip` | `366cc70e…` | 34,397,478 |
 | `srs7` | 7.0.218 | `srs-77c14a5eab4849832ecc1833ddfdd70479f3d74c.zip` | `60570ffd…` | 36,779,987 |
 
+每个来源还有一个独立的 `release` 对象，记录 OpenSight 源码修订、打包修订、
+UTC 发布日期和发行版（见下一节）。两个 major 的这些输入互不牵连。
+
 构建环境固定为 `build.image` 中的 AlmaLinux 10.2 `x86_64_v2` 镜像摘要，平台为 `linux/amd64/v2`。编译选项与当前 LVR 配方一致：
 
 ```text
@@ -34,15 +37,36 @@
 
 SRS 自身生成 `-g -O0`，因此 RPM 构建不额外注入 `-O2`。源包中的 3rdparty（ST、SRT、libsrtp、OpenSSL、FFmpeg、Opus）均已随归档提供；容器运行阶段使用 `--network=none`，不下载未锁定内容。
 
+## 发布版本与 OSS 路径
+
+运行 RPM 的 Release 遵循 LVR bootc README 的
+[OpenSight RPM publishing convention](https://github.com/OpenSight/lvr/blob/master/deploy/bootc/README.md#opensight-rpm-publishing-convention)：
+`<OpenSight 源码修订>.<打包修订>.<UTC 发布日期 YYYYMMDD>.<发行版>`。本次发布为
+`1.1.20261125.el10`。OSS 前缀为 `software/srs-rpm/`，前缀后直接使用 RPM 实际
+文件名，不再有 SHA-256 目录：
+
+```text
+software/srs-rpm/opensight-srs6-6.0.184-1.1.20261125.el10.x86_64_v2.rpm
+software/srs-rpm/opensight-srs7-7.0.218-1.1.20261125.el10.x86_64_v2.rpm
+```
+
+`sources.lock.json` 中每个来源的 `release` 对象独立保存 `source_revision`、
+`packaging_revision`、`date` 和 `dist`，两个 major 可以各自发布不同的修订和
+日期。变更受打包的软件源码时增加源码修订并把打包修订设为 1；打包、工具链或
+依赖变更需要重发时增加打包修订；重建同一发布沿用原日期。`release.py` 校验
+并按清单渲染 Release，构建入口默认使用清单值；`--release` 仅用于本地升级
+测试，并会在 `build-info.json` 标记 `release_override`。上一个公开版本是
+`1.el10`，其历史对象和 URL 继续服务已有构建。
+
 ## 输出契约
 
 `build-rpms.sh` 产出以下文件（`--out-dir`，默认 `dist/`）：
 
-- `opensight-srs6-6.0.184-1.el10.x86_64_v2.rpm`
-- `opensight-srs7-7.0.218-1.el10.x86_64_v2.rpm`
+- `opensight-srs6-6.0.184-1.1.20261125.el10.x86_64_v2.rpm`
+- `opensight-srs7-7.0.218-1.1.20261125.el10.x86_64_v2.rpm`
 - 对应的 `.src.rpm`
 - `SHA256SUMS`
-- `build-info.json`：输入摘要、构建镜像、每个产物的 NEVRA、SHA-256、大小、文件清单和动态依赖
+- `build-info.json`：逐包 Release 输入和产物（NEVRA、SHA-256、大小、文件清单、动态依赖）、输入摘要、构建镜像
 - `lvr-handoff.json`：可直接并入 LVR `sources.lock.json` 的 `srs6_rpm`/`srs7_rpm` 条目（发布前不含 `url`，不假定远程产物存在）
 
 动态依赖由 RPM 自动生成，预期只需要 `libc`、`libm`、`libstdc++` 和 `libgcc_s`；两个包之间没有依赖或冲突。RPM 不注册任何 systemd 或配置路径。
@@ -119,9 +143,9 @@ MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-la
 2. 用 `Containerfile` 从固定摘要构建 `opensight-srs-rpm-builder:el10.2`，镜像带有 `org.opensight.srs.base-image` 标签；
 3. 一次性把 builder 标签解析为不可变镜像 ID，从同一次读取取得标签，要求它与 `sources.lock.json` 的 `build.image` 一致；随后记录该 ID 并用同一个 ID 启动构建容器，避免标签在两次查询之间被替换；不一致时拒绝发布构建（实验可用 `--allow-unlocked-base`）；
 4. 在 `--network=none` 的 AlmaLinux 10.2 `x86_64_v2` 容器中运行 `rpmbuild -ba --target x86_64_v2`，并在容器内再次校验 os-release 和 glibc 架构；
-5. 在 `build-info.json` 中记录声明镜像、实际镜像标签、builder 镜像 ID/摘要、os-release 和 glibc 架构，并生成 `SHA256SUMS`。
+5. 在 `build-info.json` 中记录逐包 Release 输入、声明镜像、实际镜像标签、builder 镜像 ID/摘要、os-release 和 glibc 架构，并生成 `SHA256SUMS`。
 
-`--release N` 用于构建同一载荷的新 release（例如升级测试的 `2.el10`）。首次发布使用默认值 `1.el10`。
+构建默认从每个来源的 `release` 输入生成 Release，并在宿主机和容器内各校验一次；spec 的默认 Release 也必须与清单一致，否则发布构建失败。`--release <Release>` 只用于本地或生命周期测试（例如 `--release 1.2.20261125.el10`）；此时 `build-info.json` 记录 `release_override: true`，`release_inputs` 仍如实记录实际使用的逐包输入。
 
 `--base-image` 和 `--no-build-image` 只改变实际构建根，不会改变记录：`build-info.json` 会如实记录实际标签和不可变镜像 ID，并在 `build.runtime.base_image_matches_lock` 标出是否与锁定镜像一致。发布构建必须为 `true`；生命周期测试也会校验这一点。
 
@@ -131,11 +155,12 @@ MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-la
 
 ## 生命周期测试
 
-先构建 release 1 和用于升级测试的 release 2：
+先构建锁定发布和用于升级测试的下一个打包修订：
 
 ```bash
 ./build-rpms.sh --source-dir /path/to/pinned/sources --out-dir dist
-./build-rpms.sh --source-dir /path/to/pinned/sources --out-dir dist-r2 --release 2
+./build-rpms.sh --source-dir /path/to/pinned/sources --out-dir dist-r2 \
+    --release 1.2.20261125.el10
 ```
 
 然后从干净容器逐个执行场景：
@@ -149,7 +174,7 @@ MIT AND BSD-2-Clause AND OpenSSL AND MPL-2.0 AND BSD-3-Clause AND LGPL-2.1-or-la
 - `install-order-6-then-7` 与 `install-order-7-then-6`：两种安装顺序。
 - `upgrade-6` 与 `upgrade-7`：只升级一个包，另一个包的 NEVRA、可执行文件哈希和 `rpm -V` 保持不变。
 - `uninstall-6` 与 `uninstall-7`：只卸载一个包，另一个包仍可执行、归属正确，共享父目录保留。
-- `payload-contract`：包内容白名单、`x86_64_v2` 架构、动态依赖、无跨包依赖、无 systemd/配置/命令路径、许可证声明存在。
+- `payload-contract`：包内容白名单、`x86_64_v2` 架构、动态依赖、无跨包依赖、无 systemd/配置/命令路径、许可证声明存在；同时核对二进制 RPM 文件名等于 NEVRA，并用 `rpm.vercmp` 确认新 Release 高于锁定 Release 和上一公开版本（默认 `1.el10`，可用 `SRS_PREVIOUS_RELEASE` 覆盖）。
 
 每个场景都在 `--network=none` 的全新容器中运行，不接触部署设备。
 
@@ -162,17 +187,17 @@ LVR 不需要在本仓库之外重新编译 SRS。按现有 `ffmpeg_rpm` 的模�
 ```json
 {
   "srs6_rpm": {
-    "url": "https://<immutable-object-store>/<sha256>/opensight-srs6-6.0.184-1.el10.x86_64_v2.rpm",
-    "file": "opensight-srs6-6.0.184-1.el10.x86_64_v2.rpm",
+    "url": "https://opensight-public.oss-cn-hangzhou.aliyuncs.com/software/srs-rpm/opensight-srs6-6.0.184-1.1.20261125.el10.x86_64_v2.rpm",
+    "file": "opensight-srs6-6.0.184-1.1.20261125.el10.x86_64_v2.rpm",
     "sha256": "<build-info.json 中的 sha256>",
     "size_bytes": 12345678,
     "rpm": {
       "name": "opensight-srs6",
       "epoch": 0,
       "version": "6.0.184",
-      "release": "1.el10",
+      "release": "1.1.20261125.el10",
       "arch": "x86_64_v2",
-      "nevra": "opensight-srs6-6.0.184-1.el10.x86_64_v2"
+      "nevra": "opensight-srs6-6.0.184-1.1.20261125.el10.x86_64_v2"
     }
   }
 }
@@ -185,7 +210,8 @@ LVR 不需要在本仓库之外重新编译 SRS。按现有 `ffmpeg_rpm` 的模�
 4. `verify-image.sh`/`verify-booted.sh` 增加 `rpm -qf /usr/lib/opensight/srs/v6/srs` 与 `v7/srs` 的归属断言，并用 `rpm -q` 记录两个 NEVRA。
 5. LVR 的服务、配置和选择逻辑通过 `run-srs`/`srs_version.py` 指向所选版本的 `/usr/lib/opensight/srs/v{6,7}/srs`；不要恢复 `/usr/lib/opensight/srs/srs` 或 `srs-6.0.184` 旧路径。
 
-`lvr-handoff.json` 默认不含 `url`。在上传并远程校验 RPM 之后，用对象前缀重新生成带 URL 的条目：
+`lvr-handoff.json` 默认不含 `url`。在上传并远程校验 RPM 之后，用扁平的
+`software/srs-rpm` 对象前缀重新生成带 URL 的条目：
 
 ```bash
 ./make-lvr-handoff.py --build-info dist/build-info.json \
@@ -193,7 +219,9 @@ LVR 不需要在本仓库之外重新编译 SRS。按现有 `ffmpeg_rpm` 的模�
     --out dist/lvr-handoff.published.json
 ```
 
-在对象上传并远程校验之前，不应假定任何远程产物存在；`lvr-handoff.proposed-url.json` 一类的文件只表示建议的不可变键。
+生成的 `url` 为 `<prefix>/<RPM 实际文件名>`，与公开 key 一一对应。在对象上传
+并远程校验之前，不应假定任何远程产物存在；`lvr-handoff.proposed-url.json`
+一类的文件只表示建议的不可变键。
 
 ## 可复现性说明
 

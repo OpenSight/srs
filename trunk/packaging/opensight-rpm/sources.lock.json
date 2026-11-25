@@ -13,6 +13,12 @@
     "srs6": {
       "package": "opensight-srs6",
       "version": "6.0.184",
+      "release": {
+        "source_revision": 1,
+        "packaging_revision": 1,
+        "date": "20261125",
+        "dist": "el10"
+      },
       "url": "https://opensight-public.oss-cn-hangzhou.aliyuncs.com/software/srs-opensight-v6.0-20260222.zip",
       "file": "srs-opensight-v6.0-20260222.zip",
       "sha256": "366cc70ef07799ef162b5c6f07b4660ea6e45cef41bbdc02173d13a7a7edfb57",
@@ -34,6 +40,12 @@
     "srs7": {
       "package": "opensight-srs7",
       "version": "7.0.218",
+      "release": {
+        "source_revision": 1,
+        "packaging_revision": 1,
+        "date": "20261125",
+        "dist": "el10"
+      },
       "commit": "77c14a5eab4849832ecc1833ddfdd70479f3d74c",
       "tree": "f5af5f26c7aabd78159b765fde90d395fca41126",
       "url": "https://codeload.github.com/OpenSight/srs/zip/77c14a5eab4849832ecc1833ddfdd70479f3d74c",
