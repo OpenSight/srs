@@ -121,15 +121,20 @@ assert_rpm_identity() {
     assert_eq "$actual" "$expected"
 }
 
-# rpmvercmp returns 1 when the first release is newer.  This covers both the
-# previous published release (1.el10) and an explicit upgrade release.
+# rpmvercmp returns 1 when the first release is newer.  The values travel
+# through the environment, never through the Lua source, so a release string
+# cannot alter the expression.
 assert_vercmp() {
     local left=$1 right=$2 expected=$3 result
-    result=$(rpm --eval "%{lua:print(rpm.vercmp('$left', '$right'))}") \
+    result=$(SRS_VERCMP_LEFT=$left SRS_VERCMP_RIGHT=$right \
+        rpm --eval '%{lua:print(rpm.vercmp(os.getenv("SRS_VERCMP_LEFT"), os.getenv("SRS_VERCMP_RIGHT")))}') \
         || fail "cannot compare releases $left and $right"
     assert_eq "$result" "$expected"
 }
 
+# SRS_PREVIOUS_RELEASE=1.el10 is the pre-convention baseline recorded for this
+# first conversion of the three OpenSight RPMs.  It is a one-time migration
+# check, not a general comparison across upstream Version changes.
 assert_release_contract() {
     local pkg=$1 current previous=${SRS_PREVIOUS_RELEASE:?}
     current=$(installed_release "$pkg")

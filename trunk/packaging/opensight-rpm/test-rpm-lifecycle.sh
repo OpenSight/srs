@@ -10,8 +10,9 @@
 #                   1.2.20261125.el10).
 #
 # Each scenario starts from a clean container, so install order, upgrade and
-# erase are independent of earlier scenarios.  SRS_PREVIOUS_RELEASE sets the
-# last published release used for the ordering check (default: 1.el10).
+# erase are independent of earlier scenarios.  SRS_PREVIOUS_RELEASE is the
+# one-time pre-convention baseline for this first conversion of the three
+# OpenSight RPMs (default: 1.el10); it is not a general cross-Version check.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,6 +20,7 @@ PODMAN=${PODMAN:-podman}
 BASE_IMAGE=${BASE_IMAGE:-}
 RPM_DIR=${RPM_DIR:-}
 UPGRADE_RPM_DIR=${UPGRADE_RPM_DIR:-}
+# One-time migration baseline for the first three OpenSight RPMs.
 PREVIOUS_RELEASE=${SRS_PREVIOUS_RELEASE:-1.el10}
 SCENARIOS=()
 
