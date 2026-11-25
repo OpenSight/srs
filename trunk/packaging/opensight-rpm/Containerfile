@@ -1,0 +1,33 @@
+# Reproducible builder for the OpenSight SRS v6/v7 runtime RPMs.
+#
+# The base image is the same AlmaLinux 10.2 x86_64_v2 userspace consumed by
+# the LVR appliance.  Keep the digest in sync with sources.lock.json's
+# build.image; build-rpms.sh passes it as BASE_IMAGE.
+ARG BASE_IMAGE=quay.io/almalinuxorg/almalinux@sha256:607a7368ceaff7b76991a9d33ca489dcd6f2b699deaa65ef712d7b8d661ddcc3
+FROM ${BASE_IMAGE}
+
+# A global ARG must be re-declared after FROM to be usable in later steps.
+ARG BASE_IMAGE
+
+# Provenance for build-rpms.sh: a reused image must still prove which userspace
+# it was built from.  The value is compared with sources.lock.json build.image.
+LABEL org.opensight.srs.base-image="${BASE_IMAGE}"
+
+# Build dependencies mirror the reviewed LVR SRS build stage.  nasm lives in
+# CRB, as it does in the appliance recipe.
+RUN dnf -y --setopt=install_weak_deps=False install \
+      gcc gcc-c++ make cmake patch perl tar unzip diffutils findutils \
+      automake pkgconf-pkg-config which python3 tcl openssl openssl-devel \
+      rpm-build cpio \
+    && dnf -y --enablerepo=crb --setopt=install_weak_deps=False install nasm \
+    && dnf clean all
+
+# Compilation baseline guard: fail the image build if the base is not the
+# promised AlmaLinux 10.2 x86_64_v2 userspace.
+RUN . /etc/os-release \
+    && test "$ID" = almalinux \
+    && test "$VERSION_ID" = 10.2 \
+    && test "$(rpm -q --qf '%{ARCH}' glibc)" = x86_64_v2 \
+    && grep -Rqs x86_64_v2 /etc/yum.repos.d
+
+WORKDIR /work
